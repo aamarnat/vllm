@@ -4,6 +4,12 @@ Test for all-gather + GEMM fusion using iris.x.all_gather_gemm
 This test demonstrates using iris.x.all_gather_gemm instead of the default
 symm_mem.fused_all_gather_matmul for tensor-parallel fusion.
 
+Sharding Strategy:
+- Shards on M dimension: each rank has input (M_local, K)
+- All-gather on dim=0 produces (M, K) where M = M_local * world_size
+- Then performs GEMM: (M, K) @ (K, N) = (M, N)
+- Note: vLLM's AsyncTPPass pattern matcher expects dim=0 (M-dimension) sharding
+
 Key changes:
 1. Registers torch.ops.iris.all_gather_gemm as a custom op
 2. TestAGMMModel.ops_in_model_after() returns iris op when available
@@ -81,9 +87,9 @@ def iris_all_gather_gemm_wrapper(
     This calls the actual iris.x.all_gather_gemm Triton kernel.
     
     Args:
-        x: Input tensor to all-gather (M_local, K)
+        x: Input tensor to all-gather (M_local, K) - sharded on M dimension
         weights: List of weight tensors [(K, N)]
-        gather_dim: Dimension along which to gather (typically 0)
+        gather_dim: Dimension along which to gather (0 for M dimension)
         group_name: Process group name
         
     Returns:
@@ -110,7 +116,7 @@ def iris_all_gather_gemm_wrapper(
         world_size = 1
         cur_rank = 0
     
-    # Unpack dimensions
+    # Unpack dimensions - sharding on M dimension
     M_local = x.shape[0]
     K = x.shape[1]
     M = M_local * world_size
@@ -125,7 +131,7 @@ def iris_all_gather_gemm_wrapper(
     if world_size == 1:
         A_gathered[:] = x
     else:
-        # In multi-GPU: perform actual all-gather
+        # In multi-GPU: perform actual all-gather on M dimension
         # The iris kernel expects A_gathered to be pre-populated
         # TODO: Why is iris expecting A_gathered to be already gathered?
         if dist.is_initialized():
@@ -221,7 +227,7 @@ def iris_all_gather_gemm_fake(
     _FAKE_CALL_COUNT += 1
     print(f"[META] iris_all_gather_gemm_fake called (count: {_FAKE_CALL_COUNT}, device: {x.device})")
     
-    # Infer shapes
+    # Infer shapes - sharding on M dimension
     world_size = 2  # Default assumption
     M_local = x.shape[0]
     K = x.shape[1]
@@ -315,11 +321,13 @@ class TestAGMMModel(torch.nn.Module):
 
     def forward(self, hidden_states):
         """
-        Forward pass implementing the mm + all gather in the FX graph
+        Forward pass implementing the mm + all gather in the FX graph.
+        Sharding on M dimension: each rank has (M_local, K), gather to (M, K).
         """
-        # Reshape input
+        # Reshape input to ensure correct shape
         view = hidden_states.reshape(-1, self.hidden_size)
-        all_gather = tensor_model_parallel_all_gather(view, dim=0)
+        # All-gather on M dimension to get (M, K)
+        all_gather = tensor_model_parallel_all_gather(view, dim=0)  # Gather on M dimension
         permute = self.weight.permute(1, 0)
         mm = torch.mm(all_gather, permute)
         return mm
@@ -339,7 +347,11 @@ class TestAGMMModel(torch.nn.Module):
 
 
 def simple_test():
-    """Simple test without distributed setup (single GPU)"""
+    """Simple test without distributed setup (single GPU)
+    
+    Note: In single-GPU mode, we use the full hidden_size since there's no
+    actual sharding. The all_gather on dim=0 will just replicate the input.
+    """
     print("Running simple TestAGMMModel test...")
     reset_execution_counts()
     
@@ -361,7 +373,7 @@ def simple_test():
     model = TestAGMMModel(hidden_size=hidden_size, dtype=dtype)
     model = model.to(device)
     
-    # Create test input
+    # Create test input (full size for single GPU)
     hidden_states = torch.randn(
         (batch_size * seq_len, hidden_size), 
         dtype=dtype, 
@@ -372,7 +384,7 @@ def simple_test():
     print(f"Input shape: {hidden_states.shape}")
     print(f"Model weight shape: {model.weight.shape}")
     
-    # Run forward pass (note: all_gather will behave differently without distributed setup)
+    # Run forward pass (note: all_gather on dim=1 will replicate without distributed setup)
     try:
         output = model(hidden_states)
         print(f"Output shape: {output.shape}")
@@ -586,6 +598,10 @@ def async_tp_test(local_rank, world_size, dynamic=False):
     if dynamic:
         torch._dynamo.mark_dynamic(hidden_states, 0)
     
+    # Synchronize before starting compilation
+    if dist.is_initialized():
+        dist.barrier()
+    
     print(f"Rank {local_rank}: Compiling model with AsyncTPPass...")
     
     # Compile the model with AsyncTPPass
@@ -595,19 +611,61 @@ def async_tp_test(local_rank, world_size, dynamic=False):
     torch.cuda.synchronize(device)
     start_mem = torch.cuda.memory_allocated(device)
     
-    # Run forward pass (may fail with symm_mem issues)
+    # Compute reference output for validation
+    # Manually perform all-gather + matmul without fusion
+    with torch.no_grad():
+        gathered_ref = torch.zeros(
+            (hidden_states.shape[0] * world_size, hidden_states.shape[1]),
+            dtype=hidden_states.dtype,
+            device=device
+        )
+        if dist.is_initialized():
+            dist.all_gather_into_tensor(gathered_ref, hidden_states)
+        else:
+            gathered_ref = hidden_states
+        
+        # Show gathered tensor stats to verify all-gather is working correctly
+        print(f"  Rank {local_rank}: Gathered shape: {gathered_ref.shape}, mean: {gathered_ref.mean():.4f}")
+        
+        # Compute hash of gathered tensor to verify all ranks see the same data
+        gathered_hash = torch.sum(gathered_ref).item()
+        print(f"  Rank {local_rank}: Gathered tensor sum (hash): {gathered_hash:.4f}")
+        
+        weight_transposed = model.weight.permute(1, 0)
+        reference_output = torch.mm(gathered_ref, weight_transposed)
+    
+    # Run forward pass with fusion
     output = compiled_model(hidden_states)
     torch.cuda.synchronize(device)
     end_mem = torch.cuda.memory_allocated(device)
     
     print(f"✓ Rank {local_rank}: Output shape: {output.shape}")
     print(f"  Output mean: {output.mean():.4f}")
+    print(f"  Reference mean: {reference_output.mean():.4f}")
     print(f"  GPU memory used: {(end_mem - start_mem) / 1e6:.2f} MB")
     
     # ✓ VERIFICATION 7: Verify output is on correct GPU
     assert output.device.index == local_rank, f"Output on wrong GPU: {output.device.index} != {local_rank}"
     print(f"✓ Rank {local_rank}: Output on correct GPU {output.device}")
     
+    # ✓ VERIFICATION 7.5: Validate output correctness
+    max_diff = torch.max(torch.abs(output - reference_output)).item()
+    relative_error = max_diff / (torch.max(torch.abs(reference_output)).item() + 1e-8)
+    print(f"  Max absolute difference: {max_diff:.6f}")
+    print(f"  Relative error: {relative_error:.6f}")
+    
+    if max_diff > 1e-2:  # Tolerance for fp16
+        print(f"✗ Rank {local_rank}: WARNING - Output differs from reference by {max_diff:.6f}")
+        print(f"  This may indicate incorrect computation")
+        # Show sample values for debugging
+        print(f"  Sample output values: {output[0, :5]}")
+        print(f"  Sample reference values: {reference_output[0, :5]}")
+    else:
+        print(f"✓ Rank {local_rank}: Output matches reference within tolerance!")
+    
+    # Compute output hash to verify both ranks produce identical results
+    output_hash = torch.sum(output).item()
+    print(f"  Rank {local_rank}: Output tensor sum (hash): {output_hash:.4f}")
     
 
     verify_functionality(local_rank, async_tp_pass, backend, model, output)
