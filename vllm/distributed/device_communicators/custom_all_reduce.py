@@ -131,9 +131,14 @@ class CustomAllreduce:
                     CUSTOM_ALL_REDUCE_MAX_SIZES[device_capability_str][world_size],
                     max_size,
                 )
-        cuda_visible_devices = envs.CUDA_VISIBLE_DEVICES
-        if cuda_visible_devices:
-            device_ids = list(map(int, cuda_visible_devices.split(",")))
+        # Check for device visibility environment variable (CUDA or HIP for AMD)
+        visible_devices = envs.CUDA_VISIBLE_DEVICES
+        if current_platform.is_rocm():
+            # For AMD GPUs, prefer HIP_VISIBLE_DEVICES
+            visible_devices = envs.HIP_VISIBLE_DEVICES or visible_devices
+        
+        if visible_devices:
+            device_ids = list(map(int, visible_devices.split(",")))
         else:
             device_ids = list(range(cuda_device_count_stateless()))
 
