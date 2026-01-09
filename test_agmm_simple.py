@@ -63,6 +63,7 @@ from compile.backend import TestBackend
 
 
 # Try to import iris.x.all_gather_gemm
+import iris
 from iris.x.all_gather_gemm import all_gather_gemm as iris_all_gather_gemm_kernel
 from tritonblas.kernels.stages.indexing import grid_setup
 IRIS_AVAILABLE = True
@@ -102,6 +103,8 @@ def iris_all_gather_gemm_wrapper(
     if not IRIS_AVAILABLE:
         raise RuntimeError("iris.x.all_gather_gemm not available")
     
+    shmem = iris.iris()
+    
     # Get distributed info
     try:
         if dist.is_initialized():
@@ -122,6 +125,10 @@ def iris_all_gather_gemm_wrapper(
     M = M_local * world_size
     weight = weights[0]
     N = weight.shape[1]
+
+    A_original = x
+    A_iris = shmem.zeros(x.shape, dtype=x.dtype, device=x.device)
+    A_iris.copy_(A_original)
     
     # Allocate output tensors
     A_gathered = torch.zeros((M, K), dtype=x.dtype, device=x.device)
@@ -133,7 +140,7 @@ def iris_all_gather_gemm_wrapper(
     else:
         # In multi-GPU: perform actual all-gather on M dimension
         # The iris kernel expects A_gathered to be pre-populated
-        # TODO: Why is iris expecting A_gathered to be already gathered?
+        # TODO: Why is iris.x all_gather_gemm is only doing a gemm and is expecting A_gathered to be already gathered - change for now to example all_gather_gemm implementation
         if dist.is_initialized():
             dist.all_gather_into_tensor(A_gathered, x)
         else:
@@ -155,8 +162,8 @@ def iris_all_gather_gemm_wrapper(
     GROUP_SIZE_M = 8
     
     # Compute strides
-    stride_am = x.stride(0)
-    stride_ak = x.stride(1)
+    stride_am = A_iris.stride(0)
+    stride_ak = A_iris.stride(1)
     stride_bn = weight.stride(1)
     stride_bk = weight.stride(0)
     stride_cm = C.stride(0)
@@ -181,7 +188,7 @@ def iris_all_gather_gemm_wrapper(
     
     try:
         iris_all_gather_gemm_kernel[grid](
-            x,  # A_sharded
+            A_iris,  # A_sharded
             weight,  # B
             C,  # Output
             A_gathered,  # Gathered buffer
@@ -647,28 +654,30 @@ def async_tp_test(local_rank, world_size, dynamic=False):
     # ✓ VERIFICATION 7: Verify output is on correct GPU
     assert output.device.index == local_rank, f"Output on wrong GPU: {output.device.index} != {local_rank}"
     print(f"✓ Rank {local_rank}: Output on correct GPU {output.device}")
-    
+    verify_functionality(local_rank, async_tp_pass, backend, model, output)
+
     # ✓ VERIFICATION 7.5: Validate output correctness
-    max_diff = torch.max(torch.abs(output - reference_output)).item()
-    relative_error = max_diff / (torch.max(torch.abs(reference_output)).item() + 1e-8)
-    print(f"  Max absolute difference: {max_diff:.6f}")
-    print(f"  Relative error: {relative_error:.6f}")
-    
-    if max_diff > 1e-2:  # Tolerance for fp16
-        print(f"✗ Rank {local_rank}: WARNING - Output differs from reference by {max_diff:.6f}")
-        print(f"  This may indicate incorrect computation")
-        # Show sample values for debugging
-        print(f"  Sample output values: {output[0, :5]}")
-        print(f"  Sample reference values: {reference_output[0, :5]}")
-    else:
-        print(f"✓ Rank {local_rank}: Output matches reference within tolerance!")
-    
-    # Compute output hash to verify both ranks produce identical results
-    output_hash = torch.sum(output).item()
-    print(f"  Rank {local_rank}: Output tensor sum (hash): {output_hash:.4f}")
+    if local_rank == 0:
+        max_diff = torch.max(torch.abs(output - reference_output)).item()
+        relative_error = max_diff / (torch.max(torch.abs(reference_output)).item() + 1e-8)
+        print(f"  Max absolute difference: {max_diff:.6f}")
+        print(f"  Relative error: {relative_error:.6f}")
+
+        if max_diff > 1e-2:  # Tolerance for fp16
+            print(f"✗ Rank {local_rank}: WARNING - Output differs from reference by {max_diff:.6f}")
+            print(f"  This may indicate incorrect computation")
+            # Show sample values for debugging
+            print(f"  Sample output values: {output[0, :5]}")
+            print(f"  Sample reference values: {reference_output[0, :5]}")
+        else:
+            print(f"✓ Rank {local_rank}: Output matches reference within tolerance!")
+
+        # Compute output hash to verify both ranks produce identical results
+        output_hash = torch.sum(output).item()
+        print(f"  Rank {local_rank}: Output tensor sum (hash): {output_hash:.4f}")
     
 
-    verify_functionality(local_rank, async_tp_pass, backend, model, output)
+
     
     # Cleanup distributed resources to avoid warnings
     from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
