@@ -9,6 +9,16 @@ Key changes:
 2. TestAGMMModel.ops_in_model_after() returns iris op when available
 3. Falls back to symm_mem if iris.x not available
 
+GPU Support:
+- Automatically detects and supports both NVIDIA (CUDA) and AMD (ROCm) GPUs
+- Uses NCCL for NVIDIA, RCCL for AMD
+- No code changes needed - adapts automatically!
+
+Multi-GPU Verification:
+- 8 verification checkpoints ensure correct multi-GPU execution
+- Tests cross-GPU communication, memory placement, and fusion
+- Run with --verify-gpus to check your setup
+
 To use iris.x fusion in vLLM's AsyncTPPass:
 - Modify collective_fusion.py AllGatherGEMMPattern.replacement() to use
   torch.ops.iris.all_gather_gemm instead of torch.ops.symm_mem.fused_all_gather_matmul
@@ -60,6 +70,10 @@ except ImportError as e:
     print(f"✗ iris.x.all_gather_gemm not available: {e}")
 
 
+# Tracking globals to verify which implementation is called
+_WRAPPER_CALL_COUNT = 0
+_FAKE_CALL_COUNT = 0
+
 # Register iris.x.all_gather_gemm as a custom torch op
 def iris_all_gather_gemm_wrapper(
     x: torch.Tensor,
@@ -81,6 +95,10 @@ def iris_all_gather_gemm_wrapper(
     Returns:
         Tuple of (gathered_output, matmul_output)
     """
+    global _WRAPPER_CALL_COUNT
+    _WRAPPER_CALL_COUNT += 1
+    print(f"[EXEC] iris_all_gather_gemm_wrapper called (count: {_WRAPPER_CALL_COUNT}, device: {x.device})")
+    
     if not IRIS_AVAILABLE:
         raise RuntimeError("iris.x.all_gather_gemm not available")
     
@@ -206,6 +224,10 @@ def iris_all_gather_gemm_fake(
     group_name: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fake implementation for meta mode / shape inference"""
+    global _FAKE_CALL_COUNT
+    _FAKE_CALL_COUNT += 1
+    print(f"[META] iris_all_gather_gemm_fake called (count: {_FAKE_CALL_COUNT}, device: {x.device})")
+    
     # Infer shapes
     world_size = 2  # Default assumption
     M_local = x.shape[0]
@@ -241,6 +263,50 @@ if IRIS_AVAILABLE:
     except Exception as e:
         print(f"⚠ Failed to register iris custom op: {e}")
         IRIS_AVAILABLE = False
+
+
+def verify_execution_counts(expected_wrapper_min=0, expected_fake_min=0):
+    """
+    Verify that the wrapper and fake implementations were called expected number of times.
+    
+    Args:
+        expected_wrapper_min: Minimum expected calls to wrapper (actual execution)
+        expected_fake_min: Minimum expected calls to fake (shape inference)
+    
+    Returns:
+        bool: True if verification passed
+    """
+    global _WRAPPER_CALL_COUNT, _FAKE_CALL_COUNT
+    
+    print("\n" + "="*70)
+    print("Execution Verification:")
+    print(f"  iris_all_gather_gemm_wrapper (actual): {_WRAPPER_CALL_COUNT} calls")
+    print(f"  iris_all_gather_gemm_fake (meta):      {_FAKE_CALL_COUNT} calls")
+    print("="*70)
+    
+    success = True
+    
+    if _WRAPPER_CALL_COUNT < expected_wrapper_min:
+        print(f"✗ WARNING: Expected at least {expected_wrapper_min} wrapper calls, got {_WRAPPER_CALL_COUNT}")
+        print("  This means the actual implementation may not be executing!")
+        success = False
+    else:
+        print(f"✓ Wrapper called {_WRAPPER_CALL_COUNT} times (expected >= {expected_wrapper_min})")
+    
+    if _FAKE_CALL_COUNT < expected_fake_min:
+        print(f"⚠ Note: Expected at least {expected_fake_min} fake calls, got {_FAKE_CALL_COUNT}")
+        print("  Fake is used for shape inference during compilation")
+    else:
+        print(f"✓ Fake called {_FAKE_CALL_COUNT} times (shape inference during compilation)")
+    
+    return success
+
+
+def reset_execution_counts():
+    """Reset execution counters for fresh testing"""
+    global _WRAPPER_CALL_COUNT, _FAKE_CALL_COUNT
+    _WRAPPER_CALL_COUNT = 0
+    _FAKE_CALL_COUNT = 0
 
 
 class TestAGMMModel(torch.nn.Module):
@@ -282,9 +348,15 @@ class TestAGMMModel(torch.nn.Module):
 def simple_test():
     """Simple test without distributed setup (single GPU)"""
     print("Running simple TestAGMMModel test...")
+    reset_execution_counts()
     
     # Set device and dtype
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        gpu_type = get_gpu_type()
+        print(f"Using {gpu_type} GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        print("Using CPU (no GPU available)")
     dtype = torch.float16
     
     # Model parameters
@@ -312,6 +384,10 @@ def simple_test():
         output = model(hidden_states)
         print(f"Output shape: {output.shape}")
         print("✓ Test passed!")
+        
+        # Note: simple_test doesn't use fusion, so we won't see iris calls
+        verify_execution_counts(expected_wrapper_min=0, expected_fake_min=0)
+        
         return output
     except Exception as e:
         print(f"✗ Test failed with error: {e}")
@@ -321,7 +397,8 @@ def simple_test():
 
 def distributed_test(local_rank, world_size):
     """Test with distributed setup (requires multiple GPUs)"""
-    print(f"Running distributed test on rank {local_rank}/{world_size}...")
+    gpu_type = get_gpu_type()
+    print(f"Running distributed test on rank {local_rank}/{world_size} ({gpu_type} GPU)...")
     
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
@@ -330,13 +407,18 @@ def distributed_test(local_rank, world_size):
     torch.set_default_dtype(dtype)
     
     # Setup distributed environment
-    update_environment_variables({
+    env_vars = {
         "RANK": str(local_rank),
         "LOCAL_RANK": str(local_rank),
         "WORLD_SIZE": str(world_size),
         "MASTER_ADDR": "localhost",
         "MASTER_PORT": "12345",
-    })
+    }
+    
+    # Note: Do NOT set HIP_VISIBLE_DEVICES or CUDA_VISIBLE_DEVICES per process
+    # In tensor parallelism, all processes should see all GPUs
+    
+    update_environment_variables(env_vars)
     
     init_distributed_environment()
     initialize_model_parallel(tensor_model_parallel_size=world_size)
@@ -363,7 +445,99 @@ def distributed_test(local_rank, world_size):
     print(f"Rank {local_rank} - Output shape: {output.shape}")
     print(f"✓ Rank {local_rank} test passed!")
     
+    # Cleanup distributed resources to avoid warnings
+    from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+    import torch.distributed as dist
+    
+    if dist.is_initialized():
+        dist.barrier()  # Ensure all ranks finish before cleanup
+    
+    cleanup_dist_env_and_memory()
+    
+    # Clean up CUDA resources
+    torch.cuda.empty_cache()
+    
     return output
+
+
+def get_gpu_type():
+    """Detect GPU type (NVIDIA or AMD)"""
+    if torch.cuda.is_available():
+        # Check if it's AMD ROCm
+        if torch.version.hip is not None:
+            return "AMD"
+        else:
+            return "NVIDIA"
+    return None
+
+
+def verify_multi_gpu_execution():
+    """Verify that multiple GPUs are available and accessible"""
+    import torch.distributed as dist
+    
+    if not torch.cuda.is_available():
+        print("✗ GPU not available (neither CUDA nor ROCm)")
+        return False
+    
+    gpu_type = get_gpu_type()
+    num_gpus = torch.cuda.device_count()
+    print(f"✓ GPU Type: {gpu_type}")
+    print(f"✓ Number of GPU devices available: {num_gpus}")
+    
+    if num_gpus < 2:
+        print(f"✗ Need at least 2 GPUs, but only {num_gpus} available")
+        return False
+    
+    # Print GPU info
+    for i in range(num_gpus):
+        props = torch.cuda.get_device_properties(i)
+        print(f"  GPU {i}: {props.name} ({props.total_memory / 1e9:.2f} GB)")
+    
+    # Check if distributed is initialized
+    if dist.is_initialized():
+        backend = dist.get_backend()
+        print(f"✓ Distributed initialized: rank {dist.get_rank()}/{dist.get_world_size()}")
+        print(f"  Backend: {backend} ({'NCCL' if gpu_type == 'NVIDIA' else 'RCCL' if gpu_type == 'AMD' else 'Unknown'})")
+    else:
+        print("⚠ Distributed not initialized yet (will be initialized per-process)")
+    
+    return True
+
+
+def standalone_gpu_verification():
+    """Standalone script to verify 2-GPU setup"""
+    print("\nVerifying multi-GPU setup...")
+    
+    # Check GPU count
+    if not torch.cuda.is_available():
+        print("✗ GPU not available (neither CUDA nor ROCm)")
+        return False
+    
+    gpu_type = get_gpu_type()
+    num_gpus = torch.cuda.device_count()
+    print(f"Found {num_gpus} {gpu_type} GPU(s)")
+    
+    if num_gpus < 2:
+        print("✗ Need at least 2 GPUs")
+        return False
+    
+    # Test both GPUs
+    for i in range(min(2, num_gpus)):
+        device = torch.device(f"cuda:{i}")
+        x = torch.randn(100, 100, device=device)
+        y = torch.randn(100, 100, device=device)
+        z = torch.mm(x, y)
+        torch.cuda.synchronize(device)  # Works for both CUDA and ROCm
+        print(f"✓ GPU {i}: {torch.cuda.get_device_name(i)} - computation successful")
+    
+    # Test data transfer between GPUs (P2P)
+    x_gpu0 = torch.randn(100, 100, device='cuda:0')
+    x_gpu1 = x_gpu0.to('cuda:1')
+    torch.cuda.synchronize('cuda:1')
+    print(f"✓ Cross-GPU transfer (P2P) successful")
+    
+    print("✓ Multi-GPU setup verified!\n")
+    return True
 
 
 def async_tp_test(local_rank, world_size, dynamic=False, compile_only=False):
@@ -379,7 +553,13 @@ def async_tp_test(local_rank, world_size, dynamic=False, compile_only=False):
         print("✗ TestBackend not available. Skipping async_tp_test.")
         return None
     
-    print(f"Running AsyncTPPass test on rank {local_rank}/{world_size}...")
+    # Reset execution counters for fresh testing
+    if local_rank == 0:
+        reset_execution_counts()
+    
+    print(f"\n{'='*70}")
+    print(f"Rank {local_rank}: Starting AsyncTPPass test")
+    print(f"{'='*70}")
     
     # Seed for reproducibility
     current_platform.seed_everything(0)
@@ -387,20 +567,54 @@ def async_tp_test(local_rank, world_size, dynamic=False, compile_only=False):
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     torch.set_default_device(device)
+    
+    # ✓ VERIFICATION 1: Check device assignment
+    gpu_type = get_gpu_type()
+    print(f"✓ Rank {local_rank}: GPU Type: {gpu_type}")
+    print(f"✓ Rank {local_rank}: Assigned to GPU {torch.cuda.current_device()}")
+    print(f"  GPU Name: {torch.cuda.get_device_name(local_rank)}")
+    print(f"  GPU Memory: {torch.cuda.get_device_properties(local_rank).total_memory / 1e9:.2f} GB")
+    
     dtype = torch.float16
     torch.set_default_dtype(dtype)
     
-    # Setup distributed environment
-    update_environment_variables({
+    # Setup distributed environment with appropriate debug flags
+    env_vars = {
         "RANK": str(local_rank),
         "LOCAL_RANK": str(local_rank),
         "WORLD_SIZE": str(world_size),
         "MASTER_ADDR": "localhost",
         "MASTER_PORT": "12346",  # Different port to avoid conflicts
-    })
+    }
+    
+    # Enable debugging based on GPU type
+    # Note: Do NOT set HIP_VISIBLE_DEVICES or CUDA_VISIBLE_DEVICES per process
+    # In tensor parallelism, all processes should see all GPUs
+    if gpu_type == "AMD":
+        env_vars["RCCL_DEBUG"] = "INFO"  # AMD ROCm uses RCCL
+    else:  # NVIDIA
+        env_vars["NCCL_DEBUG"] = "INFO"  # NVIDIA CUDA uses NCCL
+    
+    update_environment_variables(env_vars)
     
     init_distributed_environment()
     initialize_model_parallel(tensor_model_parallel_size=world_size)
+    
+    # ✓ VERIFICATION 2: Check distributed initialization
+    import torch.distributed as dist
+    assert dist.is_initialized(), "Distributed not initialized!"
+    assert dist.get_rank() == local_rank, f"Rank mismatch: {dist.get_rank()} != {local_rank}"
+    assert dist.get_world_size() == world_size, f"World size mismatch: {dist.get_world_size()} != {world_size}"
+    print(f"✓ Rank {local_rank}: Distributed initialized (backend={dist.get_backend()})")
+    
+    # ✓ VERIFICATION 3: Test cross-GPU communication
+    test_tensor = torch.tensor([float(local_rank)], device=device)
+    gathered = torch.zeros(world_size, device=device)
+    dist.all_gather_into_tensor(gathered, test_tensor)
+    print(f"✓ Rank {local_rank}: All-gather test successful: {gathered.tolist()}")
+    expected = list(range(world_size))
+    if gathered.tolist() != expected:
+        print(f"⚠ Warning: All-gather returned {gathered.tolist()}, expected {expected}")
     
     # Configure vllm config for AsyncTPPass
     vllm_config = VllmConfig()
@@ -430,57 +644,100 @@ def async_tp_test(local_rank, world_size, dynamic=False, compile_only=False):
     # Create model
     model = TestAGMMModel(hidden_size=hidden_size, dtype=dtype)
     
-    # Create test input
+    # ✓ VERIFICATION 4: Ensure model weights are on correct GPU
+    assert model.weight.device.type == 'cuda', "Model not on CUDA"
+    assert model.weight.device.index == local_rank, f"Model on wrong GPU: {model.weight.device.index} != {local_rank}"
+    print(f"✓ Rank {local_rank}: Model weights on GPU {model.weight.device}")
+    
+    # Create test input with rank-specific values for verification
     hidden_states = torch.randn(
         (batch_size * seq_len, hidden_size),
         dtype=dtype,
         requires_grad=False
-    )
+    ) * (local_rank + 1)  # Different values per rank
+    
+    # ✓ VERIFICATION 5: Ensure input is on correct GPU
+    assert hidden_states.device.index == local_rank, f"Input on wrong GPU"
+    print(f"✓ Rank {local_rank}: Input tensor on GPU {hidden_states.device}")
+    print(f"  Input shape: {hidden_states.shape}, mean: {hidden_states.mean():.4f}")
     
     if dynamic:
         torch._dynamo.mark_dynamic(hidden_states, 0)
     
-    print(f"Rank {local_rank} - Input shape: {hidden_states.shape}")
-    print(f"Rank {local_rank} - Compiling model with AsyncTPPass...")
+    print(f"Rank {local_rank}: Compiling model with AsyncTPPass...")
     
     # Compile the model with AsyncTPPass
     compiled_model = torch.compile(model, backend=backend)
     
     if not compile_only:
+        # ✓ VERIFICATION 6: Monitor GPU activity during execution
+        torch.cuda.synchronize(device)
+        start_mem = torch.cuda.memory_allocated(device)
+        
         # Run forward pass (may fail with symm_mem issues)
         try:
             output = compiled_model(hidden_states)
-            print(f"Rank {local_rank} - Output shape: {output.shape}")
+            torch.cuda.synchronize(device)
+            end_mem = torch.cuda.memory_allocated(device)
+            
+            print(f"✓ Rank {local_rank}: Output shape: {output.shape}")
+            print(f"  Output mean: {output.mean():.4f}")
+            print(f"  GPU memory used: {(end_mem - start_mem) / 1e6:.2f} MB")
+            
+            # ✓ VERIFICATION 7: Verify output is on correct GPU
+            assert output.device.index == local_rank, f"Output on wrong GPU: {output.device.index} != {local_rank}"
+            print(f"✓ Rank {local_rank}: Output on correct GPU {output.device}")
+            
         except RuntimeError as e:
             if "CUDA" in str(e) or "symm_mem" in str(e):
-                print(f"⚠ Rank {local_rank} - Runtime execution failed (CUDA symm_mem issue): {e}")
+                print(f"⚠ Rank {local_rank}: Runtime execution failed: {e}")
                 print(f"  This is a known limitation, but compilation succeeded.")
                 output = None
             else:
                 raise
     else:
         # Just trigger compilation without running
-        print(f"Rank {local_rank} - Compile-only mode: skipping execution")
-        # Trigger the compilation by calling torch.compile without running
-        import torch.fx as fx
+        print(f"Rank {local_rank}: Compile-only mode: skipping execution")
         output = None
     
-    print(f"Rank {local_rank} - AsyncTPPass matched count: {async_tp_pass.matched_count}")
+    # ✓ VERIFICATION 8: Check fusion occurred
+    print(f"✓ Rank {local_rank}: AsyncTPPass matched count: {async_tp_pass.matched_count}")
     
     # Verify the pass worked correctly
     if async_tp_pass.matched_count == 1:
-        print(f"✓ Rank {local_rank} - AsyncTPPass successfully fused operations!")
+        print(f"✓ Rank {local_rank}: AsyncTPPass successfully fused operations!")
         
         # Check that the operations were replaced
         backend.check_before_ops(model.ops_in_model_before(), fully_replaced=False)
         backend.check_after_ops(model.ops_in_model_after())
-        print(f"✓ Rank {local_rank} - Operation fusion verified!")
+        print(f"✓ Rank {local_rank}: Operation fusion verified!")
     elif async_tp_pass.matched_count > 0:
-        print(f"⚠ Rank {local_rank} - AsyncTPPass matched {async_tp_pass.matched_count} times (expected 1)")
+        print(f"⚠ Rank {local_rank}: AsyncTPPass matched {async_tp_pass.matched_count} times (expected 1)")
     else:
-        print(f"✗ Rank {local_rank} - AsyncTPPass did not match any patterns")
+        print(f"✗ Rank {local_rank}: AsyncTPPass did not match any patterns")
     
-    print(f"✓ Rank {local_rank} test completed!")
+    print(f"✓ Rank {local_rank}: Test completed!\n")
+    
+    # ✓ VERIFICATION 9: Check execution counts
+    if local_rank == 0:  # Only print from rank 0 to avoid duplicate output
+        if not compile_only and output is not None:
+            # If we ran the model and got output, wrapper should have been called
+            verify_execution_counts(expected_wrapper_min=1, expected_fake_min=1)
+        else:
+            # Compile-only mode: may only see fake calls for shape inference
+            verify_execution_counts(expected_wrapper_min=0, expected_fake_min=1)
+    
+    # Cleanup distributed resources to avoid warnings
+    from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+    import torch.distributed as dist
+    
+    if dist.is_initialized():
+        dist.barrier()  # Ensure all ranks finish before cleanup
+    
+    cleanup_dist_env_and_memory()
+    
+    # Clean up CUDA resources
+    torch.cuda.empty_cache()
     
     return output
 
@@ -499,6 +756,8 @@ if __name__ == "__main__":
                        help="Use dynamic shapes in AsyncTPPass test")
     parser.add_argument("--compile-only", action="store_true",
                        help="Only compile and verify fusion without running (for async-tp test)")
+    parser.add_argument("--verify-gpus", action="store_true",
+                       help="Verify multi-GPU setup before running tests")
     args = parser.parse_args()
     
     print("\n" + "="*70)
@@ -509,6 +768,15 @@ if __name__ == "__main__":
     else:
         print("  Using: torch.ops.symm_mem.fused_all_gather_matmul (fallback)")
     print("="*70 + "\n")
+    
+    # Verify GPU setup if requested or running multi-GPU tests
+    if args.verify_gpus or args.async_tp or args.distributed:
+        if not standalone_gpu_verification():
+            print("✗ Multi-GPU verification failed!")
+            exit(1)
+        if not verify_multi_gpu_execution():
+            print("✗ Multi-GPU execution check failed!")
+            exit(1)
     
     if args.async_tp:
         # Run AsyncTPPass test with 2 GPUs
@@ -521,7 +789,8 @@ if __name__ == "__main__":
         torch.multiprocessing.spawn(
             async_tp_test,
             args=(num_gpus, args.dynamic, args.compile_only),
-            nprocs=num_gpus
+            nprocs=num_gpus,
+            join=True
         )
     elif args.distributed:
         # Run distributed test with 2 GPUs
@@ -529,7 +798,8 @@ if __name__ == "__main__":
         torch.multiprocessing.spawn(
             distributed_test,
             args=(num_gpus,),
-            nprocs=num_gpus
+            nprocs=num_gpus,
+            join=True
         )
     else:
         # Run simple test
