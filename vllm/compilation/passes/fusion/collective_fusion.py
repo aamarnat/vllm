@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from importlib.util import find_spec
 
 import torch
 import torch._inductor.pattern_matcher as pm
@@ -14,6 +15,9 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8StaticTensorSym,
+)
 from vllm.platforms import current_platform
 
 from ..inductor_pass import enable_fake_mode
@@ -21,6 +25,21 @@ from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
+# Check if iris.x.all_gather_gemm is available (at import time)
+try:
+    import os
+    os.environ.setdefault('TRITON_ALLOW_NON_CONSTEXPR_GLOBALS', '1')
+    from iris.x.all_gather_gemm import all_gather_gemm as _iris_kernel
+    _IRIS_KERNEL_AVAILABLE = True
+except (ImportError, AttributeError):
+    _IRIS_KERNEL_AVAILABLE = False
+
+def is_iris_fusion_available():
+    """Check if iris.x fusion is available (runtime check)"""
+    return (_IRIS_KERNEL_AVAILABLE and 
+            hasattr(torch.ops, 'iris') and 
+            hasattr(torch.ops.iris, 'all_gather_gemm'))
+            
 logger = init_logger(__name__)
 
 
@@ -91,6 +110,61 @@ class AllGatherGEMMPattern(BasePattern):
                 x,
                 [weight],
                 gather_dim=0,
+                group_name=self.tp.device_group.group_name,
+            )
+            return mm_outputs
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+
+class AllGatherGEMMPatternKShard(BasePattern):
+    """
+    Pattern for all-gather + GEMM fusion with K-dimension sharding.
+    
+    This pattern handles the case where the input is sharded along the K dimension:
+    - Input: (M, K_local) where K is sharded across ranks
+    - All-gather on dim=1 produces (M, K) where K = K_local * world_size
+    - Then performs GEMM: (M, K) @ (K, N) = (M, N)
+    """
+    def get_inputs(self):
+        # Input is sharded on K dimension: (M, K_local)
+        # Use dimensions that won't cause shape issues during tracing
+        M = 8  # Batch dimension
+        K_local = 4  # Local K dimension
+        K_total = K_local * self.tp_size  # Total K after all-gather
+        N = 8  # Output dimension
+        
+        x = torch.empty([M, K_local], device=self.device, dtype=self.dtype)
+        # Weight needs full K dimension after all-gather: (K, N)
+        weight = torch.empty([K_total, N], device=self.device, dtype=self.dtype)
+
+        return [x, weight]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> torch.Tensor:
+            all_gather = torch.ops.vllm.all_gather.default(
+                x,
+                dim=1,  # K-dimension sharding
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+
+            return torch.ops.aten.mm.default(all_gather, weight)
+
+        def replacement(
+            x: torch.Tensor, weight: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            # Only use iris.x.all_gather_gemm_k_shard for K-sharding
+            # Note: symm_mem.fused_all_gather_matmul doesn't support K-dimension sharding
+            ag_output, mm_outputs = torch.ops.iris.all_gather_gemm_k_shard(
+                x,
+                [weight],
+                gather_dim=1,  # K-dimension
                 group_name=self.tp.device_group.group_name,
             )
             return mm_outputs
@@ -244,7 +318,7 @@ class CutlassScaledMMReduceScatterPattern(BasePattern):
         cutlass_mm_output = torch.empty([16, 16], device=self.device, dtype=self.dtype)
         return [input, mm_weight, scale_a, scale_b, cutlass_mm_output]
 
-    def register(self, pm_pass: PatternMatcherPass) -> None:
+    def register(self, pm_pass: PatternMatcherPass):
         def pattern(
             input: torch.Tensor,
             weight: torch.Tensor,
@@ -304,7 +378,7 @@ class CutlassScaledMMReduceScatterPattern(BasePattern):
 
 
 class AllGatherCutlassScaledMMPattern(BasePattern):
-    def get_inputs(self) -> list[torch.Tensor]:
+    def get_inputs(self):
         x = torch.empty([8, 16], device=self.device, dtype=FP8_DTYPE)
         weight = (
             torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
@@ -381,27 +455,31 @@ class AsyncTPPass(VllmPatternMatcherPass):
         self.patterns: PatternMatcherPass = PatternMatcherPass(
             pass_name="async_tp_pass"
         )
-        GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.patterns)
+        # GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.patterns)
 
+        # Find M-shard AGMM pattern 
         AllGatherGEMMPattern(self.model_dtype, self.device).register(self.patterns)
+        
+        # Find K-shard AGMM pattern 
+        AllGatherGEMMPatternKShard(self.model_dtype, self.device).register(self.patterns)
 
         # These fusions are enabled only for bfloat16 models because
         # `scaled_mm` or `cutlass_scaled_mm` with per-token (row-wise) scaling
         # only supports bfloat16 as the output dtype.
-        if self.model_dtype == torch.bfloat16:
-            ScaledMMReduceScatterPattern(self.model_dtype, self.device).register(
-                self.patterns
-            )
-            AllGatherScaledMMPattern(self.model_dtype, self.device).register(
-                self.patterns
-            )
+        # if self.model_dtype == torch.bfloat16:
+        #     ScaledMMReduceScatterPattern(self.model_dtype, self.device).register(
+        #         self.patterns
+        #     )
+        #     AllGatherScaledMMPattern(self.model_dtype, self.device).register(
+        #         self.patterns
+        #     )
 
-            CutlassScaledMMReduceScatterPattern(self.model_dtype, self.device).register(
-                self.patterns
-            )
-            AllGatherCutlassScaledMMPattern(self.model_dtype, self.device).register(
-                self.patterns
-            )
+        #     CutlassScaledMMReduceScatterPattern(self.model_dtype, self.device).register(
+        #         self.patterns
+        #     )
+        #     AllGatherCutlassScaledMMPattern(self.model_dtype, self.device).register(
+        #         self.patterns
+        #     )
 
         self.dump_patterns(config, self.patterns)
 
