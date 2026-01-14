@@ -458,7 +458,7 @@ class AsyncTPPass(VllmPatternMatcherPass):
         # GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.patterns)
 
         # Find M-shard AGMM pattern 
-        AllGatherGEMMPattern(self.model_dtype, self.device).register(self.patterns)
+        # AllGatherGEMMPattern(self.model_dtype, self.device).register(self.patterns)
         
         # Find K-shard AGMM pattern 
         AllGatherGEMMPatternKShard(self.model_dtype, self.device).register(self.patterns)

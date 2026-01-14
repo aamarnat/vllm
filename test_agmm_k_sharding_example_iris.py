@@ -61,12 +61,19 @@ if tests_path.exists() and str(tests_path) not in sys.path:
 from compile.backend import TestBackend
 
 
-# Try to import iris.x.all_gather_gemm
+# Import iris and the persistent_ag_gemm kernel
 import iris
-from iris.x.all_gather_gemm import all_gather_gemm as iris_all_gather_gemm_kernel
-from tritonblas.kernels.stages.indexing import grid_setup
+import sys
+from pathlib import Path
+# Add iris examples directory to path
+workspace_path = Path(__file__).parent.parent  # /workspace
+iris_examples_path = workspace_path / "iris" / "examples" / "14_all_gather_gemm"
+if iris_examples_path.exists() and str(iris_examples_path) not in sys.path:
+    sys.path.insert(0, str(iris_examples_path))
+
+from all_gather_gemm_pull import persistent_ag_gemm  # type: ignore
 IRIS_AVAILABLE = True
-print("✓ iris.x.all_gather_gemm available")
+print("✓ persistent_ag_gemm kernel available")
 
 
 
@@ -98,8 +105,8 @@ def iris_all_gather_gemm_k_shard_wrapper(
     _WRAPPER_CALL_COUNT += 1
     print(f"[EXEC] iris_all_gather_gemm_k_shard_wrapper called (count: {_WRAPPER_CALL_COUNT}, device: {x.device})")
     
-    if not IRIS_AVAILABLE:
-        raise RuntimeError("iris.x.all_gather_gemm not available")
+    if not IRIS_AVAILABLE or persistent_ag_gemm is None:
+        raise RuntimeError("persistent_ag_gemm kernel not available")
     
     shmem = iris.iris()
     
@@ -124,98 +131,65 @@ def iris_all_gather_gemm_k_shard_wrapper(
     weight = weights[0]
     N = weight.shape[1]
 
-    A_original = x
+    # Allocate a tensor in Iris's shared memory heap for remote access
     A_iris = shmem.zeros(x.shape, dtype=x.dtype, device=x.device)
-    A_iris.copy_(A_original)
+    A_iris.copy_(x)
     
     # Allocate output tensors
+    # Note: persistent_ag_gemm performs all-gather internally via RDMA (iris.load),
     A_gathered = torch.zeros((M, K), dtype=x.dtype, device=x.device)
-    C = torch.zeros((M, N), dtype=x.dtype, device=x.device)
-    
-    # For single-GPU testing: simulate all-gather by replicating
-    if world_size == 1:
-        A_gathered[:] = x
-    else:
-        # In multi-GPU: perform actual all-gather on K dimension
-        # The iris kernel expects A_gathered to be pre-populated
-        # TODO: Why is iris.x all_gather_gemm is only doing a gemm and is expecting A_gathered to be already gathered - change for now to example all_gather_gemm implementation
-        if dist.is_initialized():
-            # all_gather_into_tensor only supports dim=0, so use list-based approach
-            tensor_list = [torch.zeros_like(x) for _ in range(world_size)]
-            dist.all_gather(tensor_list, x)
-            # Concatenate along dim=1 (K dimension)
-            A_gathered = torch.cat(tensor_list, dim=1)
-        else:
-            # Fallback: just copy for testing
-            A_gathered[:, :K_local] = x
-    
-    # Call the iris.x.all_gather_gemm kernel
-    # Note: For K-sharding, we need to adjust the kernel call
-    
+    C = torch.zeros((M, N), dtype=x.dtype, device=x.device)  # Output tensor for kernel
+
     # Kernel parameters
-    BLOCK_M = 16
-    BLOCK_N = 16
-    BLOCK_K = 16
-    # Calculate number of SMs based on total tiles
-    num_tiles = ((M + BLOCK_M - 1) // BLOCK_M) * ((N + BLOCK_N - 1) // BLOCK_N)
-    NUM_SMS = max(1, min(108, num_tiles))  # Number of SMs to use (clamp between 1 and 108)
+    BLOCK_M = 256
+    BLOCK_N = 64
+    BLOCK_K = 64
+    GROUP_SIZE_M = 6
     NUM_XCDS = 1  # Single chiplet
-    CHUNK_SIZE = 1
-    GROUP_SIZE_M = 8
+    # Use actual GPU multiprocessor count
+    NUM_SMS = torch.cuda.get_device_properties(x.device).multi_processor_count
     
     # Compute strides
     stride_am = A_iris.stride(0)
     stride_ak = A_iris.stride(1)
-    stride_bn = weight.stride(1)
     stride_bk = weight.stride(0)
+    stride_bn = weight.stride(1)
     stride_cm = C.stride(0)
     stride_cn = C.stride(1)
-    stride_ag_m = A_gathered.stride(0)
-    stride_ag_n = A_gathered.stride(1)
     
-    # Heap bases for RDMA (placeholder for testing)
-    heap_bases = torch.zeros((world_size,), dtype=torch.int64, device=x.device)
+    # Get heap bases from shmem for RDMA communication
+    heap_bases = shmem.get_heap_bases()
     
     # Kernel configuration
-    BIAS = 0
-    bias_ptr = None
-    stride_bias = 0
+    # EVEN_K checks if K (total) is evenly divisible by BLOCK_K
     EVEN_K = (K % BLOCK_K == 0)
-    ALLOW_TF32 = True
-    CACHE_MODIFIER_A = ""
-    CACHE_MODIFIER_B = ""
     
-    # Launch the iris.x.all_gather_gemm kernel
+    # Launch the persistent_ag_gemm kernel
     grid = (NUM_SMS,)
     
-
-    iris_all_gather_gemm_kernel[grid](
-        A_iris,  # A_sharded
-        weight,  # B
-        C,  # Output
-        A_gathered,  # Gathered buffer
-        bias_ptr,
-        M, N, K,
-        stride_am, stride_ak,
-        stride_bn, stride_bk,
-        stride_cm, stride_cn,
-        stride_ag_m, stride_ag_n,
-        stride_bias,
-        heap_bases,
-        cur_rank=cur_rank,
-        world_size=world_size,
+    persistent_ag_gemm[grid](
+        A_iris,
+        weight,
+        C,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
         BLOCK_SIZE_M=BLOCK_M,
         BLOCK_SIZE_N=BLOCK_N,
         BLOCK_SIZE_K=BLOCK_K,
         GROUP_SIZE_M=GROUP_SIZE_M,
         NUM_SMS=NUM_SMS,
         NUM_XCDS=NUM_XCDS,
-        CHUNK_SIZE=CHUNK_SIZE,
-        BIAS=BIAS,
         EVEN_K=EVEN_K,
-        CACHE_MODIFIER_A=CACHE_MODIFIER_A,
-        CACHE_MODIFIER_B=CACHE_MODIFIER_B,
-        ALLOW_TF32=ALLOW_TF32,
+        heap_bases=heap_bases,
+        cur_rank=cur_rank,
+        world_size=world_size,
     )
 
     torch.cuda.synchronize()
