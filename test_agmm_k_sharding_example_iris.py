@@ -1,5 +1,5 @@
 """
-Test for all-gather + GEMM fusion with K-sharding using iris.x.all_gather_gemm
+Test for all-gather + GEMM fusion with K-sharding using aiter.fused_all_gather_gemm_k_shard
 
 This test demonstrates K-dimension sharding instead of M-dimension sharding.
 
@@ -24,7 +24,7 @@ Multi-GPU Verification:
 - Tests cross-GPU communication, memory placement, and fusion
 - Run with --verify-gpus to check your setup
 
-To use iris.x fusion in vLLM's AsyncTPPass:
+To use aiter fused ops in vLLM's AsyncTPPass:
 - Uses AllGatherGEMMPatternKShard in collective_fusion.py
 - This pattern handles K-dimension sharding (dim=1)
 """
@@ -60,226 +60,10 @@ if tests_path.exists() and str(tests_path) not in sys.path:
     sys.path.insert(0, str(tests_path))
 from compile.backend import TestBackend
 
+import aiter
 
-# Import iris and the persistent_ag_gemm kernel
-import iris
-import sys
-from pathlib import Path
-# Add iris examples directory to path
-workspace_path = Path(__file__).parent.parent  # /workspace
-iris_examples_path = workspace_path / "iris" / "examples" / "14_all_gather_gemm"
-if iris_examples_path.exists() and str(iris_examples_path) not in sys.path:
-    sys.path.insert(0, str(iris_examples_path))
-
-from all_gather_gemm_pull import persistent_ag_gemm  # type: ignore
-IRIS_AVAILABLE = True
-print("✓ persistent_ag_gemm kernel available")
-
-
-
-# Tracking globals to verify which implementation is called
-_WRAPPER_CALL_COUNT = 0
-
-# Register iris.x.all_gather_gemm as a custom torch op (K-sharding variant)
-def iris_all_gather_gemm_k_shard_wrapper(
-    x: torch.Tensor,
-    weights: list[torch.Tensor],
-    gather_dim: int,
-    group_name: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Wrapper function for iris.x.all_gather_gemm to be used as a torch custom op.
-    
-    This variant handles K-dimension sharding.
-    
-    Args:
-        x: Input tensor to all-gather (M, K_local) - sharded on K dimension
-        weights: List of weight tensors [(K, N)]
-        gather_dim: Dimension along which to gather (1 for K dimension)
-        group_name: Process group name
-        
-    Returns:
-        Tuple of (gathered_output, matmul_output)
-    """
-    global _WRAPPER_CALL_COUNT
-    _WRAPPER_CALL_COUNT += 1
-    print(f"[EXEC] iris_all_gather_gemm_k_shard_wrapper called (count: {_WRAPPER_CALL_COUNT}, device: {x.device})")
-    
-    if not IRIS_AVAILABLE or persistent_ag_gemm is None:
-        raise RuntimeError("persistent_ag_gemm kernel not available")
-    
-    shmem = iris.iris()
-    
-    # Get distributed info
-    try:
-        if dist.is_initialized():
-            world_size = dist.get_world_size()
-            cur_rank = dist.get_rank()
-        else:
-            # Not in distributed mode, use defaults for testing
-            world_size = 1
-            cur_rank = 0
-    except (RuntimeError, ValueError):
-        # Not in distributed mode, use defaults for testing
-        world_size = 1
-        cur_rank = 0
-    
-    # Unpack dimensions - sharding on K dimension
-    M = x.shape[0]
-    K_local = x.shape[1]
-    K = K_local * world_size
-    weight = weights[0]
-    N = weight.shape[1]
-
-    # Allocate a tensor in Iris's shared memory heap for remote access
-    A_iris = shmem.zeros(x.shape, dtype=x.dtype, device=x.device)
-    A_iris.copy_(x)
-    
-    # Allocate output tensors
-    # Note: persistent_ag_gemm performs all-gather internally via RDMA (iris.load),
-    A_gathered = torch.zeros((M, K), dtype=x.dtype, device=x.device)
-    C = torch.zeros((M, N), dtype=x.dtype, device=x.device)  # Output tensor for kernel
-
-    # Kernel parameters
-    BLOCK_M = 256
-    BLOCK_N = 64
-    BLOCK_K = 64
-    GROUP_SIZE_M = 6
-    NUM_XCDS = 1  # Single chiplet
-    # Use actual GPU multiprocessor count
-    NUM_SMS = torch.cuda.get_device_properties(x.device).multi_processor_count
-    
-    # Compute strides
-    stride_am = A_iris.stride(0)
-    stride_ak = A_iris.stride(1)
-    stride_bk = weight.stride(0)
-    stride_bn = weight.stride(1)
-    stride_cm = C.stride(0)
-    stride_cn = C.stride(1)
-    
-    # Get heap bases from shmem for RDMA communication
-    heap_bases = shmem.get_heap_bases()
-    
-    # Kernel configuration
-    # EVEN_K checks if K (total) is evenly divisible by BLOCK_K
-    EVEN_K = (K % BLOCK_K == 0)
-    
-    # Launch the persistent_ag_gemm kernel
-    grid = (NUM_SMS,)
-    
-    persistent_ag_gemm[grid](
-        A_iris,
-        weight,
-        C,
-        M,
-        N,
-        K,
-        stride_am,
-        stride_ak,
-        stride_bk,
-        stride_bn,
-        stride_cm,
-        stride_cn,
-        BLOCK_SIZE_M=BLOCK_M,
-        BLOCK_SIZE_N=BLOCK_N,
-        BLOCK_SIZE_K=BLOCK_K,
-        GROUP_SIZE_M=GROUP_SIZE_M,
-        NUM_SMS=NUM_SMS,
-        NUM_XCDS=NUM_XCDS,
-        EVEN_K=EVEN_K,
-        heap_bases=heap_bases,
-        cur_rank=cur_rank,
-        world_size=world_size,
-    )
-
-    torch.cuda.synchronize()
-    shmem.barrier()
-    dist.barrier()
-    
-    return A_gathered, C
-
-
-def iris_all_gather_gemm_k_shard_fake(
-    x: torch.Tensor,
-    weights: list[torch.Tensor],
-    gather_dim: int,
-    group_name: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fake implementation for meta mode / shape inference (K-sharding)"""
-    
-    # Infer shapes - sharding on K dimension
-    world_size = 2  # Default assumption
-    M = x.shape[0]
-    K_local = x.shape[1]
-    K = K_local * world_size
-    N = weights[0].shape[1]
-    
-    gathered = torch.empty((M, K), dtype=x.dtype, device=x.device)
-    output = torch.empty((M, N), dtype=x.dtype, device=x.device)
-    
-    return gathered, output
-
-
-# Register the custom op for K-sharding
-if IRIS_AVAILABLE:
-    try:
-        from torch.library import Library
-        from vllm.utils.torch_utils import direct_register_custom_op
-        
-        # Create a library for iris ops
-        iris_lib = Library("iris", "DEF")
-        
-        # Use vLLM's direct_register_custom_op which handles compilation properly
-        direct_register_custom_op(
-            op_name="all_gather_gemm_k_shard",
-            op_func=iris_all_gather_gemm_k_shard_wrapper,
-            mutates_args=[],
-            fake_impl=iris_all_gather_gemm_k_shard_fake,
-            target_lib=iris_lib,
-        )
-        
-        print("✓ Registered torch.ops.iris.all_gather_gemm_k_shard custom op")
-    except Exception as e:
-        print(f"⚠ Failed to register iris custom op: {e}")
-        IRIS_AVAILABLE = False
-
-
-def verify_execution_counts(expected_wrapper_min=0):
-    """
-    Verify that the wrapper and fake implementations were called expected number of times.
-    
-    Args:
-        expected_wrapper_min: Minimum expected calls to wrapper (actual execution)
-        expected_fake_min: Minimum expected calls to fake (shape inference)
-    
-    Returns:
-        bool: True if verification passed
-    """
-    global _WRAPPER_CALL_COUNT
-    
-    print("\n" + "="*70)
-    print("Execution Verification:")
-    print(f"  iris_all_gather_gemm_k_shard_wrapper (actual): {_WRAPPER_CALL_COUNT} calls")
-    print("="*70)
-    
-    success = True
-    
-    if _WRAPPER_CALL_COUNT < expected_wrapper_min:
-        print(f"✗ WARNING: Expected at least {expected_wrapper_min} wrapper calls, got {_WRAPPER_CALL_COUNT}")
-        print("  This means the actual implementation may not be executing!")
-        success = False
-    else:
-        print(f"✓ Wrapper called {_WRAPPER_CALL_COUNT} times (expected >= {expected_wrapper_min})")
-    
-    
-    return success
-
-
-def reset_execution_counts():
-    """Reset execution counters for fresh testing"""
-    global _WRAPPER_CALL_COUNT
-    _WRAPPER_CALL_COUNT = 0
-
+# Determine if aiter fused ops are available (adapted from vllm/compilation/collective_fusion.py)
+AITER_FUSED_AVAILABLE = hasattr(torch.ops, "aiter") and hasattr(torch.ops.aiter, "fused_all_gather_gemm_k_shard")
 
 class TestAGMMKShardModel(torch.nn.Module):
     def __init__(self, hidden_size=16, dtype=torch.float16):
@@ -316,9 +100,9 @@ class TestAGMMKShardModel(torch.nn.Module):
 
     def ops_in_model_after(self):
         """Operations that should exist after AsyncTPPass fusion"""
-        if IRIS_AVAILABLE:
-            # Use iris.x.all_gather_gemm_k_shard if available
-            return [torch.ops.iris.all_gather_gemm_k_shard.default]
+        if AITER_FUSED_AVAILABLE:
+            # Use aiter.fused_all_gather_gemm_k_shard if available
+            return [torch.ops.aiter.fused_all_gather_gemm_k_shard.default]
         else:
             # K-sharding doesn't work with symm_mem - if iris is not available,
             # the pattern won't be registered and all_gather won't be replaced
@@ -332,7 +116,6 @@ def simple_test():
     actual sharding. The all_gather on dim=1 will just replicate the input.
     """
     print("Running simple TestAGMMKShardModel test...")
-    reset_execution_counts()
     
     # Set device and dtype
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -368,9 +151,6 @@ def simple_test():
         output = model(hidden_states)
         print(f"Output shape: {output.shape}")
         print("✓ Test passed!")
-        
-        # Note: simple_test doesn't use fusion, so we won't see iris calls
-        verify_execution_counts(expected_wrapper_min=0)
         
         return output
     except Exception as e:
@@ -449,12 +229,6 @@ def verify_functionality(local_rank, async_tp_pass, backend, model, output):
 
     print(f"✓ Rank {local_rank}: Test completed!\n")
 
-    # ✓ VERIFICATION 9: Check execution counts
-    if local_rank == 0:  # Only print from rank 0 to avoid duplicate output
-        if output is not None:
-            # If we ran the model and got output, wrapper should have been called
-            verify_execution_counts(expected_wrapper_min=1)
-
 def async_tp_test(local_rank, world_size, dynamic=False):
     """Test with AsyncTPPass applied (requires multiple GPUs and TestBackend)
     
@@ -463,11 +237,6 @@ def async_tp_test(local_rank, world_size, dynamic=False):
         world_size: Total number of GPUs
         dynamic: Whether to use dynamic shapes
     """
-    
-    # Reset execution counters for fresh testing
-    if local_rank == 0:
-        reset_execution_counts()
-    
     print(f"\n{'='*70}")
     print(f"Rank {local_rank}: Starting AsyncTPPass test (K-sharding)")
     print(f"{'='*70}")
@@ -629,17 +398,21 @@ def async_tp_test(local_rank, world_size, dynamic=False):
     if local_rank == 0:
         max_diff = torch.max(torch.abs(output - reference_output)).item()
         relative_error = max_diff / (torch.max(torch.abs(reference_output)).item() + 1e-8)
+        
+        print("="*70)
+        # Use ✅ for zero/near-zero difference, ❌ for non-zero
+        diff_emoji = "✅" if max_diff < 1e-2 else "❌"
         print(f"  Max absolute difference: {max_diff:.6f}")
         print(f"  Relative error: {relative_error:.6f}")
 
         if max_diff > 1e-2:  # Tolerance for fp16
-            print(f"✗ Rank {local_rank}: WARNING - Output differs from reference by {max_diff:.6f}")
+            print(f"{diff_emoji} Rank {local_rank}: WARNING - Output differs from reference by {max_diff:.6f}")
             print(f"  This may indicate incorrect computation")
             # Show sample values for debugging
             print(f"  Sample output values: {output[0, :5]}")
             print(f"  Sample reference values: {reference_output[0, :5]}")
         else:
-            print(f"✓ Rank {local_rank}: Output matches reference within tolerance!")
+            print(f"{diff_emoji} Rank {local_rank}: Output matches reference within tolerance!")
 
         # Compute output hash to verify both ranks produce identical results
         output_hash = torch.sum(output).item()
@@ -665,7 +438,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Test all-gather + GEMM fusion with K-sharding using iris.x or symm_mem"
+        description="Test all-gather + GEMM fusion with K-sharding using aiter fused ops or symm_mem"
     )
     parser.add_argument("--async-tp", action="store_true",
                        help="Run AsyncTPPass test with compilation (requires 2 GPUs)")
@@ -677,9 +450,9 @@ if __name__ == "__main__":
     
     print("\n" + "="*70)
     print("Test Configuration (K-SHARDING):")
-    print(f"  iris.x available: {IRIS_AVAILABLE}")
-    if IRIS_AVAILABLE:
-        print("  Using: torch.ops.iris.all_gather_gemm_k_shard")
+    print(f"  aiter fused ops available: {AITER_FUSED_AVAILABLE}")
+    if AITER_FUSED_AVAILABLE:
+        print("  Using: torch.ops.aiter.fused_all_gather_gemm_k_shard")
     else:
         print("  Using: torch.ops.symm_mem.fused_all_gather_matmul (fallback)")
         exit(1)

@@ -25,22 +25,19 @@ from ..vllm_inductor_pass import VllmInductorPass, VllmPatternMatcherPass
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
-# Check if iris.x.all_gather_gemm is available (at import time)
-try:
-    import os
-    os.environ.setdefault('TRITON_ALLOW_NON_CONSTEXPR_GLOBALS', '1')
-    from iris.x.all_gather_gemm import all_gather_gemm as _iris_kernel
-    _IRIS_KERNEL_AVAILABLE = True
-except (ImportError, AttributeError):
-    _IRIS_KERNEL_AVAILABLE = False
+# Check if aiter fused ops are available (at import time)
+import os
+os.environ.setdefault('TRITON_ALLOW_NON_CONSTEXPR_GLOBALS', '1')
 
-def is_iris_fusion_available():
-    """Check if iris.x fusion is available (runtime check)"""
-    return (_IRIS_KERNEL_AVAILABLE and 
-            hasattr(torch.ops, 'iris') and 
-            hasattr(torch.ops.iris, 'all_gather_gemm'))
+def is_aiter_fusion_available():
+    """Check if aiter fused ops are available (runtime check)"""
+    return (hasattr(torch.ops, 'aiter') and 
+            hasattr(torch.ops.aiter, 'fused_all_gather_gemm_k_shard'))
             
 logger = init_logger(__name__)
+
+if hasattr(torch.ops._C, "scaled_fp4_quant"):
+    STATIC_FP4_QUANT_OP = torch.ops._C.scaled_fp4_quant.default
 
 
 class BasePattern:
@@ -106,12 +103,21 @@ class AllGatherGEMMPattern(BasePattern):
             return torch.ops.aten.mm.default(all_gather, weight)
 
         def replacement(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-            ag_output, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
-                x,
-                [weight],
-                gather_dim=0,
-                group_name=self.tp.device_group.group_name,
-            )
+            # Use aiter.fused_all_gather_gemm if available, otherwise fall back to symm_mem
+            if is_aiter_fusion_available():
+                ag_output, mm_outputs = torch.ops.aiter.fused_all_gather_gemm(
+                    x,
+                    [weight],
+                    gather_dim=0,
+                    group_name=self.tp.device_group.group_name,
+                )
+            else:
+                ag_output, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
+                    x,
+                    [weight],
+                    gather_dim=0,
+                    group_name=self.tp.device_group.group_name,
+                )
             return mm_outputs
 
         pm.register_replacement(
@@ -159,9 +165,9 @@ class AllGatherGEMMPatternKShard(BasePattern):
         def replacement(
             x: torch.Tensor, weight: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            # Only use iris.x.all_gather_gemm_k_shard for K-sharding
+            # Only use aiter.fused_all_gather_gemm_k_shard for K-sharding
             # Note: symm_mem.fused_all_gather_matmul doesn't support K-dimension sharding
-            ag_output, mm_outputs = torch.ops.iris.all_gather_gemm_k_shard(
+            ag_output, mm_outputs = torch.ops.aiter.fused_all_gather_gemm_k_shard(
                 x,
                 [weight],
                 gather_dim=1,  # K-dimension
