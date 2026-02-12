@@ -31,13 +31,16 @@ To use aiter fused ops in vLLM's AsyncTPPass:
 
 import torch
 import os
-from vllm.compilation.collective_fusion import AsyncTPPass
+import random
+import numpy as np
+from vllm.compilation.passes.fusion.collective_fusion import AsyncTPPass
 from vllm.config import (
     CompilationConfig,
     DeviceConfig,
     ModelConfig,
     PassConfig,
     VllmConfig,
+    set_current_vllm_config,
 )
 from vllm.distributed import tensor_model_parallel_all_gather
 from vllm.distributed.parallel_state import (
@@ -64,6 +67,20 @@ import aiter
 
 # Determine if aiter fused ops are available (adapted from vllm/compilation/collective_fusion.py)
 AITER_FUSED_AVAILABLE = hasattr(torch.ops, "aiter") and hasattr(torch.ops.aiter, "fused_all_gather_gemm_k_shard")
+
+
+def seed_everything(seed: int) -> None:
+    platform_seed = getattr(current_platform, "seed_everything", None)
+    if callable(platform_seed):
+        platform_seed(seed)
+        return
+
+    # Fallback for platform backends that do not expose seed_everything.
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 class TestAGMMKShardModel(torch.nn.Module):
     def __init__(self, hidden_size=16, dtype=torch.float16):
@@ -242,7 +259,7 @@ def async_tp_test(local_rank, world_size, dynamic=False):
     print(f"{'='*70}")
     
     # Seed for reproducibility
-    current_platform.seed_everything(0)
+    seed_everything(0)
     
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
@@ -310,7 +327,8 @@ def async_tp_test(local_rank, world_size, dynamic=False):
     
     # Create AsyncTPPass and backend
     async_tp_pass = AsyncTPPass(vllm_config)
-    backend = TestBackend(async_tp_pass)
+    with set_current_vllm_config(vllm_config):
+        backend = TestBackend(async_tp_pass)
     
     # Model parameters - for K-sharding, hidden_size is divided across ranks
     hidden_size_per_rank = 8  # K_local
@@ -350,7 +368,8 @@ def async_tp_test(local_rank, world_size, dynamic=False):
     print(f"Rank {local_rank}: Compiling model with AsyncTPPass...")
     
     # Compile the model with AsyncTPPass
-    compiled_model = torch.compile(model, backend=backend)
+    with set_current_vllm_config(vllm_config):
+        compiled_model = torch.compile(model, backend=backend)
     
     # ✓ VERIFICATION 6: Monitor GPU activity during execution
     torch.cuda.synchronize(device)
@@ -380,7 +399,8 @@ def async_tp_test(local_rank, world_size, dynamic=False):
         reference_output = torch.mm(gathered_ref, model.weight)
     
     # Run forward pass with fusion
-    output = compiled_model(hidden_states)
+    with set_current_vllm_config(vllm_config):
+        output = compiled_model(hidden_states)
     torch.cuda.synchronize(device)
     end_mem = torch.cuda.memory_allocated(device)
     
