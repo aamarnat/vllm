@@ -115,6 +115,26 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
             if self.pass_config.eliminate_noops:
                 self.passes += [NoOpEliminationPass(config)]
 
+            if self.pass_config.fuse_gemm_all_reduce:
+                from .fusion.collective_fusion import GEMMAllReducePass
+                self.passes += [GEMMAllReducePass(config)]
+
+                if current_platform.is_rocm():
+                    try:
+                        from aiter.ops.triton.comms.fused.fused_gemm_all_reduce import (
+                            init_iris,
+                            warmup_buffers,
+                        )
+                        init_iris()
+                        # Pre-cache device_context tensor and SM count so that
+                        # these host-side operations don't happen during
+                        # CUDAGraph capture. Per-shape buffer allocation
+                        # happens during the warmup forward pass.
+                        warmup_buffers()
+                    except Exception as e:
+                        logger.warning("Failed to initialize iris for "
+                                       "fused GEMM+AR: %s", e)
+
             if self.pass_config.enable_sp:
                 self.passes += [SequenceParallelismPass(config)]
                 if self.pass_config.fuse_gemm_comms:

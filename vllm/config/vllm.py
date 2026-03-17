@@ -137,6 +137,7 @@ OPTIMIZATION_LEVEL_00 = {
             "fuse_attn_quant": False,
             "enable_sp": False,
             "fuse_gemm_comms": False,
+            "fuse_gemm_all_reduce": False,
             "fuse_act_padding": False,
         },
         "cudagraph_mode": CUDAGraphMode.NONE,
@@ -155,6 +156,7 @@ OPTIMIZATION_LEVEL_01 = {
             "fuse_attn_quant": False,
             "enable_sp": False,
             "fuse_gemm_comms": False,
+            "fuse_gemm_all_reduce": False,
             "fuse_act_padding": enable_norm_pad_fusion,
         },
         "cudagraph_mode": CUDAGraphMode.PIECEWISE,
@@ -173,6 +175,7 @@ OPTIMIZATION_LEVEL_02 = {
             "fuse_attn_quant": IS_QUANTIZED,
             "enable_sp": IS_DENSE,
             "fuse_gemm_comms": IS_DENSE,
+            "fuse_gemm_all_reduce": False,
             "fuse_act_padding": enable_norm_pad_fusion,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
@@ -191,6 +194,7 @@ OPTIMIZATION_LEVEL_03 = {
             "fuse_attn_quant": IS_QUANTIZED,
             "enable_sp": IS_DENSE,
             "fuse_gemm_comms": IS_DENSE,
+            "fuse_gemm_all_reduce": False,
             "fuse_act_padding": enable_norm_pad_fusion,
         },
         "cudagraph_mode": CUDAGraphMode.FULL_AND_PIECEWISE,
@@ -797,6 +801,13 @@ class VllmConfig:
                 self.compilation_config.mode,
             )
             self.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
+        # fused GEMM+all_reduce requires TP>1 (ROCm only, runs before SP)
+        if self.compilation_config.pass_config.fuse_gemm_all_reduce:
+            if self.parallel_config.tensor_parallel_size == 1:
+                logger.warning(
+                    "fuse_gemm_all_reduce requires TP>1, disabling")
+                self.compilation_config.pass_config.fuse_gemm_all_reduce = False
 
         # async tp is built on top of sequence parallelism
         # and requires it to be enabled.

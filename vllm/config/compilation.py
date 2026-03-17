@@ -121,6 +121,8 @@ class PassConfig:
     """Enable sequence parallelism."""
     fuse_gemm_comms: bool = Field(default=None)
     """Enable async TP."""
+    fuse_gemm_all_reduce: bool = Field(default=None)
+    """Fuse GEMM + all_reduce into a single iris-backed kernel (ROCm)."""
     fuse_allreduce_rms: bool = Field(default=None)
     """Enable flashinfer allreduce fusion."""
 
