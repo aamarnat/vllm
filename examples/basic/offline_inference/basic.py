@@ -16,7 +16,18 @@ sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 def main():
     # Create an LLM.
-    llm = LLM(model="facebook/opt-125m")
+    llm = LLM(
+        model="unsloth/Llama-3.2-3B-Instruct",
+        tensor_parallel_size=2,
+        enforce_eager=False,
+        gpu_memory_utilization=0.4,
+        compilation_config={
+            "level": 3,  # Set to VLLM_COMPILE mode
+            # "cudagraph_mode": "NONE",  # Explicitly disable CUDA graphs
+            "pass_config": {"enable_sequence_parallelism": True, "enable_async_tp": True}  # Using deprecated name for now
+        },
+    )
+    # fuse_gemm_comms
     # Generate texts from the prompts.
     # The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.
