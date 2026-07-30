@@ -132,6 +132,8 @@ class PassConfig:
     (threshold is device-capability dependent)."""
     fuse_gemm_comms: bool = None  # type: ignore[assignment]
     """Enable async TP."""
+    fuse_gemm_all_reduce: bool = None  # type: ignore[assignment]
+    """Fuse GEMM + all_reduce into a single iris-backed kernel (ROCm)."""
     fuse_allreduce_rms: bool = None  # type: ignore[assignment]
     """Enable flashinfer allreduce fusion."""
     enable_qk_norm_rope_fusion: bool = None  # type: ignore[assignment]

@@ -34,6 +34,7 @@ if current_platform.is_cuda_alike() or current_platform.is_xpu():
         AddRMSNormFusionPass,
         RMSNormReshapeFusionPass,
     )
+    from .fusion.collective_fusion import AsyncTPPass
     from .fusion.qk_norm_rope_fusion import QKNormRoPEFusionPass
     from .fusion.sequence_parallelism import SequenceParallelismPass
     from .utility.split_coalescing import SplitCoalescingPass
@@ -50,7 +51,6 @@ if current_platform.is_cuda_alike():
 
 if current_platform.is_cuda():
     from .fusion.allreduce_rms_fusion import AllReduceFusionPass
-    from .fusion.collective_fusion import AsyncTPPass
 
 if current_platform.is_xpu():
     from .fusion.act_quant_fusion import ActivationQuantFusionPass
@@ -157,6 +157,29 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
         with set_current_vllm_config(config, check_compile=False):
             if self.pass_config.eliminate_noops:
                 self.passes += [NoOpEliminationPass(config)]
+
+            if self.pass_config.fuse_gemm_all_reduce:
+                from .fusion.collective_fusion import GEMMAllReducePass
+
+                self.passes += [GEMMAllReducePass(config)]
+
+                if current_platform.is_rocm():
+                    try:
+                        from aiter.ops.triton.comms.fused.fused_gemm_all_reduce import (
+                            init_iris,
+                            warmup_buffers,
+                        )
+
+                        init_iris()
+                        # Pre-cache device_context tensor and SM count so that
+                        # these host-side operations don't happen during
+                        # CUDAGraph capture. Per-shape buffer allocation
+                        # happens during the warmup forward pass.
+                        warmup_buffers()
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to initialize iris for fused GEMM+AR: %s", e
+                        )
 
             if self.pass_config.enable_sp:
                 self.passes += [SequenceParallelismPass(config)]
