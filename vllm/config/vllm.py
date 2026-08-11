@@ -236,6 +236,7 @@ OPTIMIZATION_LEVEL_00 = {
             "enable_sp": False,
             "fuse_gemm_comms": False,
             "fuse_gemm_all_reduce": False,
+            "fuse_gemm_reduce_scatter": "off",
             "fuse_act_padding": False,
             "fuse_mla_dual_rms_norm": False,
             "fuse_rope_kvcache": False,
@@ -260,6 +261,7 @@ OPTIMIZATION_LEVEL_01 = {
             "enable_sp": False,
             "fuse_gemm_comms": False,
             "fuse_gemm_all_reduce": False,
+            "fuse_gemm_reduce_scatter": "off",
             "fuse_act_padding": enable_norm_pad_fusion,
             "fuse_mla_dual_rms_norm": enable_mla_dual_rms_norm_fusion,
             "fuse_rope_kvcache": False,
@@ -284,6 +286,7 @@ OPTIMIZATION_LEVEL_02 = {
             "enable_sp": IS_DENSE,
             "fuse_gemm_comms": IS_DENSE,
             "fuse_gemm_all_reduce": False,
+            "fuse_gemm_reduce_scatter": "off",
             "fuse_act_padding": enable_norm_pad_fusion,
             "fuse_mla_dual_rms_norm": enable_mla_dual_rms_norm_fusion,
             "fuse_rope_kvcache": enable_rope_kvcache_fusion,
@@ -308,6 +311,7 @@ OPTIMIZATION_LEVEL_03 = {
             "enable_sp": IS_DENSE,
             "fuse_gemm_comms": IS_DENSE,
             "fuse_gemm_all_reduce": False,
+            "fuse_gemm_reduce_scatter": "off",
             "fuse_act_padding": enable_norm_pad_fusion,
             "fuse_mla_dual_rms_norm": enable_mla_dual_rms_norm_fusion,
             "fuse_rope_kvcache": enable_rope_kvcache_fusion,
@@ -1339,6 +1343,12 @@ class VllmConfig:
             logger.warning("fuse_gemm_all_reduce requires TP>1, disabling")
             pass_config.fuse_gemm_all_reduce = False
 
+        # the reduce_scatter fusion patterns are registered by AsyncTPPass and
+        # match nodes that only sequence parallelism introduces.
+        fuse_rs = pass_config.fuse_gemm_reduce_scatter not in (None, "off")
+        if fuse_rs:
+            pass_config.fuse_gemm_comms = True
+
         # async tp is built on top of sequence parallelism and requires it.
         if pass_config.fuse_gemm_comms:
             pass_config.enable_sp = True
@@ -1369,6 +1379,54 @@ class VllmConfig:
                     )
                     pass_config.enable_sp = False
                     pass_config.fuse_gemm_comms = False
+
+        # GEMMAllReducePass runs before SequenceParallelismPass and consumes
+        # the all_reduce nodes it matches, i.e. those produced by a GEMM -
+        # exactly the ones SP rewrites into reduce_scatter+all_gather. Both
+        # sides are opt-in here, so reject rather than silently degrade one.
+        # Checked after the resolution above so a config where SP auto-disables
+        # anyway does not fail on a conflict that never materialises.
+        if pass_config.fuse_gemm_all_reduce and pass_config.enable_sp:
+            raise ValueError(
+                "fuse_gemm_all_reduce is incompatible with sequence "
+                "parallelism (enable_sp) and async TP (fuse_gemm_comms): "
+                "the fused GEMM+all_reduce pass consumes the GEMM-fed "
+                "all_reduce ops that sequence parallelism rewrites into "
+                "reduce_scatter+all_gather. Enable at most one of them."
+            )
+
+        # Same conflict from the other side: with GEMMAllReducePass in front,
+        # sequence parallelism never gets an all_reduce to rewrite and no
+        # reduce_scatter node is ever produced for these patterns to match.
+        if fuse_rs and pass_config.fuse_gemm_all_reduce:
+            raise ValueError(
+                "fuse_gemm_reduce_scatter is incompatible with "
+                "fuse_gemm_all_reduce: the fused GEMM+all_reduce pass runs "
+                "first and consumes the GEMM-fed all_reduce ops that sequence "
+                "parallelism rewrites into the reduce_scatter this fusion "
+                "matches. Enable at most one of them."
+            )
+
+        # Checked after the SP resolution above so that an auto-downgrade of
+        # sequence parallelism disables this fusion instead of failing the run.
+        if fuse_rs and not pass_config.enable_sp:
+            logger.warning(
+                "fuse_gemm_reduce_scatter requires sequence parallelism "
+                "(enable_sp) and TP>1 to produce reduce_scatter ops, disabling"
+            )
+            pass_config.fuse_gemm_reduce_scatter = "off"
+
+        # Same overlap against AR+RMS fusion, but fuse_allreduce_rms is on by
+        # default at O2+ on ROCm/AITER, so warn instead of rejecting the run.
+        if pass_config.fuse_gemm_all_reduce and pass_config.fuse_allreduce_rms:
+            logger.warning(
+                "fuse_gemm_all_reduce and fuse_allreduce_rms both consume "
+                "all_reduce ops and GEMMAllReducePass runs first: GEMM-fed "
+                "all_reduce ops are fused into GEMM+all_reduce and only the "
+                "remaining ones reach the all_reduce+RMSNorm fusion. Set "
+                "fuse_allreduce_rms=false to measure GEMM+all_reduce in "
+                "isolation, or fuse_gemm_all_reduce=false to keep AR+RMS."
+            )
 
         from vllm.utils.torch_utils import HAS_OPAQUE_TYPE
 

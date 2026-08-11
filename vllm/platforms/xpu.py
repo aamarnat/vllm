@@ -3,7 +3,7 @@
 
 import contextlib
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -315,20 +315,27 @@ class XPUPlatform(Platform):
         pass_config = compilation_config.pass_config
         fusion_passes_to_disable = {
             "fuse_gemm_comms": "Async TP",
+            "fuse_gemm_all_reduce": "Fused GEMM + all_reduce",
+            "fuse_gemm_reduce_scatter": "Fused GEMM + reduce_scatter",
             "fuse_allreduce_rms": "AllReduce + RMSNorm fusion",
             "fuse_attn_quant": "Attention + quant fusion",
             "fuse_act_padding": "Activation + padding fusion",
             "fuse_rope_kvcache": "RoPE + KV cache fusion",
             "fuse_rope_kvcache_cat_mla": "RoPE + KV cache + MLA fusion",
         }
+        # fuse_gemm_reduce_scatter is a mode string, not a bool, so "off" is
+        # truthy and it needs its own disabled value.
+        disabled_values: dict[str, Any] = {"fuse_gemm_reduce_scatter": "off"}
         if compilation_config.mode != CompilationMode.NONE:
             for flag, feature_name in fusion_passes_to_disable.items():
-                if getattr(pass_config, flag):
+                disabled = disabled_values.get(flag, False)
+                value = getattr(pass_config, flag)
+                if value and value != disabled:
                     logger.warning_once(
                         "Feature %r is not yet supported on XPU and will be disabled.",
                         feature_name,
                     )
-                    setattr(pass_config, flag, False)
+                    setattr(pass_config, flag, disabled)
 
         # check and update parallel config
         parallel_config = vllm_config.parallel_config
