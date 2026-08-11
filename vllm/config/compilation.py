@@ -33,6 +33,8 @@ else:
 
 logger = init_logger(__name__)
 
+GEMMReduceScatterMode = Literal["off", "fused", "standalone"]
+
 
 class CompilationMode(enum.IntEnum):
     """The compilation approach used for torch.compile-based compilation of the
@@ -134,6 +136,11 @@ class PassConfig:
     """Enable async TP."""
     fuse_gemm_all_reduce: bool = None  # type: ignore[assignment]
     """Fuse GEMM + all_reduce into a single iris-backed kernel (ROCm)."""
+    fuse_gemm_reduce_scatter: GEMMReduceScatterMode = None  # type: ignore[assignment]
+    """Rewrite sequence-parallel reduce_scatter into an iris-backed kernel
+    (ROCm). `"fused"` rewrites GEMM+reduce_scatter pairs into a single fused
+    kernel, `"standalone"` rewrites the bare reduce_scatter only, `"off"`
+    disables. Requires `enable_sp` and TP>1."""
     fuse_allreduce_rms: bool = None  # type: ignore[assignment]
     """Enable flashinfer allreduce fusion."""
     enable_qk_norm_rope_fusion: bool = None  # type: ignore[assignment]
@@ -232,6 +239,8 @@ class PassConfig:
         "fuse_attn_quant",
         "enable_sp",
         "fuse_gemm_comms",
+        "fuse_gemm_all_reduce",
+        "fuse_gemm_reduce_scatter",
         "fuse_allreduce_rms",
         "fuse_act_padding",
         "fuse_mla_dual_rms_norm",
@@ -280,6 +289,21 @@ class PassConfig:
                 "CUDA, ROCm or XPU. The fusion will be disabled."
             )
             self.enable_qk_norm_rope_fusion = False
+        if self.fuse_gemm_all_reduce and not current_platform.is_rocm():
+            logger.warning_once(
+                "Fused GEMM+all_reduce enabled but the current platform is not "
+                "ROCm. The fusion will be disabled."
+            )
+            self.fuse_gemm_all_reduce = False
+        if (
+            self.fuse_gemm_reduce_scatter not in (None, "off")
+            and not current_platform.is_rocm()
+        ):
+            logger.warning_once(
+                "Fused reduce_scatter enabled but the current platform is not "
+                "ROCm. The fusion will be disabled."
+            )
+            self.fuse_gemm_reduce_scatter = "off"
         if self.fuse_act_padding and not current_platform.is_rocm():
             logger.warning_once(
                 "Padding fusion enabled but the current platform is not ROCm. "

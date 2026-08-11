@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import functools
 from collections.abc import Callable
 from typing import Any, ParamSpec, TypeVar
@@ -140,6 +141,56 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
 
         VllmPatternMatcherPass.log_match_summary()
 
+    def _warmup_fused_reduce_scatter(self, config: VllmConfig) -> None:
+        """Materialize the iris buffers the fused reduce-scatter ops need.
+
+        Must run after `AsyncTPPass` is constructed, since that is what declares
+        the shapes. Anything left unwarmed performs a collective symmetric-heap
+        allocation, an RCCL communicator creation or a Triton JIT compile on its
+        first forward, all of which deadlock inside a graph capture region.
+
+        Args:
+            config: The full vLLM config, holding the capture sizes, the model
+                dtype and the hidden size.
+        """
+        from vllm.distributed import get_tp_group
+
+        try:
+            from aiter.ops.triton.comms.fused.fused_gemm_reduce_scatter import (
+                init_iris,
+                warmup_buffers,
+            )
+        except ImportError as e:
+            logger.warning("Failed to import iris fused GEMM+reduce_scatter: %s", e)
+            return
+
+        compilation_config = config.compilation_config
+        compile_sizes = set(compilation_config.cudagraph_capture_sizes or ())
+        compile_sizes.update(
+            m for m in (compilation_config.compile_sizes or ()) if isinstance(m, int)
+        )
+
+        model_config = config.model_config
+        weight_shapes = None
+        dtype = None
+        if model_config is not None:
+            hidden_size = model_config.get_hidden_size()
+            weight_shapes = [(hidden_size, hidden_size)]
+            dtype = model_config.dtype
+
+        try:
+            init_iris()
+            warmup_buffers(
+                compile_sizes=sorted(compile_sizes),
+                weight_shapes=weight_shapes,
+                dtype=dtype,
+                group_name=get_tp_group().device_group.group_name,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to initialize iris for fused GEMM+reduce_scatter: %s", e
+            )
+
     def configure(self, config: VllmConfig) -> None:
         self.pass_config = config.compilation_config.pass_config
         model_config = config.model_config
@@ -159,10 +210,9 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 self.passes += [NoOpEliminationPass(config)]
 
             if self.pass_config.fuse_gemm_all_reduce:
-                from .fusion.collective_fusion import GEMMAllReducePass
-
-                self.passes += [GEMMAllReducePass(config)]
-
+                # Import aiter BEFORE constructing the pass: the aiter custom
+                # ops are registered as a side effect of this import, and the
+                # pass refuses to build if they are missing.
                 if current_platform.is_rocm():
                     try:
                         from aiter.ops.triton.comms.fused.fused_gemm_all_reduce import (
@@ -181,10 +231,25 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                             "Failed to initialize iris for fused GEMM+AR: %s", e
                         )
 
+                from .fusion.collective_fusion import GEMMAllReducePass
+
+                self.passes += [GEMMAllReducePass(config)]
+
             if self.pass_config.enable_sp:
                 self.passes += [SequenceParallelismPass(config)]
                 if self.pass_config.fuse_gemm_comms:
+                    if current_platform.is_rocm():
+                        # AsyncTPPass probes for aiter ops when deciding which
+                        # patterns to register, so import aiter first.
+                        with contextlib.suppress(Exception):
+                            import aiter.ops.triton.comms.fused  # noqa: F401
+
                     self.passes += [AsyncTPPass(config)]
+
+                    if current_platform.is_rocm() and (
+                        self.pass_config.fuse_gemm_reduce_scatter not in (None, "off")
+                    ):
+                        self._warmup_fused_reduce_scatter(config)
 
             if enable_transformers_norm_canonicalization:
                 self.passes += [AddRMSNormFusionPass(config)]
