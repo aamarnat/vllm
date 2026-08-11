@@ -34,11 +34,9 @@ FP8_DTYPE = current_platform.fp8_dtype()
 os.environ.setdefault("TRITON_ALLOW_NON_CONSTEXPR_GLOBALS", "1")
 
 
-def is_aiter_fusion_available() -> bool:
-    """Check if aiter fused ops are available (runtime check)"""
-    return hasattr(torch.ops, "aiter") and hasattr(
-        torch.ops.aiter, "fused_all_gather_gemm_k_shard"
-    )
+def _has_aiter_op(op_name: str) -> bool:
+    """Check whether a specific aiter custom op is registered."""
+    return hasattr(torch.ops, "aiter") and hasattr(torch.ops.aiter, op_name)
 
 
 logger = init_logger(__name__)
@@ -406,7 +404,11 @@ class AllGatherGEMMPattern(BasePattern):
             return torch.ops.aten.mm.default(all_gather, weight)
 
         def replacement(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-            if current_platform.is_rocm():
+            # Prefer the aiter kernel on ROCm, but fall back to symm_mem when it
+            # is unavailable so ROCm keeps the upstream fusion either way.
+            if current_platform.is_rocm() and _has_aiter_op(
+                "fused_all_gather_gemm_m_shard"
+            ):
                 ag_output, mm_outputs = torch.ops.aiter.fused_all_gather_gemm_m_shard(
                     x,
                     [weight],
@@ -1119,6 +1121,147 @@ class ROCmGEMMAllReduceWithBiasPattern(BasePattern):
         )
 
 
+class ROCmGEMMReduceScatterPattern(BasePattern):
+    """
+    Pattern for ROCm unquantized GEMM + reduce-scatter fusion.
+
+    On ROCm, UnquantizedLinearMethod dispatches through
+    torch.ops.vllm.rocm_unquantized_gemm, so upstream's GEMMReduceScatterPattern
+    (which matches aten.mm) never fires. This pattern matches:
+        rocm_unquantized_gemm(x, weight, bias=None) -> reduce_scatter(result)
+    and replaces it with the iris-backed gemm_reduce_scatter_m_shard.
+
+    The reduce_scatter node is introduced by SequenceParallelismPass, so this
+    pattern is only registerable from a pass that runs after it.
+
+    Only matches when bias is None (RowParallelLinear on ranks > 0). The weight
+    is in (N, K_local) layout (F.linear convention) and the fused kernel wants
+    (K_local, N), hence weight.t().
+    """
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        x = torch.empty([16, 4], device=self.device, dtype=self.dtype)
+        weight = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        return [x, weight]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> torch.Tensor:
+            gemm = torch.ops.vllm.rocm_unquantized_gemm.default(x, weight, None)
+            return torch.ops.vllm.reduce_scatter.default(
+                gemm,
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+
+        def replacement(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.ops.aiter.gemm_reduce_scatter_m_shard(
+                x,
+                [weight.t()],
+                None,
+                0,
+                self.tp.device_group.group_name,
+            )
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+
+class ROCmGEMMReduceScatterWithBiasPattern(BasePattern):
+    """
+    Pattern for ROCm unquantized GEMM + reduce-scatter fusion when bias is present.
+
+    Matches RowParallelLinear on rank 0, where bias is a real tensor:
+        rocm_unquantized_gemm(x, weight, bias) -> reduce_scatter(result)
+
+    Correctness: the bias is passed INTO the fused op, which folds it into the
+    pre-reduction partial via addmm. Reduce-scatter sums across ranks per row,
+    so rank 0's bias lands in every output row exactly once. Adding it to the
+    op's output instead would bias only the row slice rank 0 owns -- unlike the
+    all-reduce case, where every rank holds the full sum.
+    """
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        x = torch.empty([16, 4], device=self.device, dtype=self.dtype)
+        weight = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        bias = torch.empty([4], device=self.device, dtype=self.dtype)
+        return [x, weight, bias]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor,
+        ) -> torch.Tensor:
+            gemm = torch.ops.vllm.rocm_unquantized_gemm.default(x, weight, bias)
+            return torch.ops.vllm.reduce_scatter.default(
+                gemm,
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+
+        def replacement(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor,
+        ) -> torch.Tensor:
+            return torch.ops.aiter.gemm_reduce_scatter_m_shard(
+                x,
+                [weight.t()],
+                bias,
+                0,
+                self.tp.device_group.group_name,
+            )
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+
+class ROCmReduceScatterPattern(BasePattern):
+    """
+    Pattern replacing a bare vllm.reduce_scatter with the iris reduce-scatter.
+
+    Standalone fallback for deployments where the producer is not a fusable
+    GEMM: the partial sum is copied into the symmetric-heap staging buffer and
+    reduced by the same one-shot pull kernel, without touching the producer.
+
+    This anchors on the same node as the GEMM+RS patterns and matches any
+    producer, so it is registered only when the fused patterns are not.
+    """
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        return [torch.empty([16, 4], device=self.device, dtype=self.dtype)]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(x: torch.Tensor) -> torch.Tensor:
+            return torch.ops.vllm.reduce_scatter.default(
+                x,
+                dim=0,
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+
+        def replacement(x: torch.Tensor) -> torch.Tensor:
+            return torch.ops.aiter.reduce_scatter_m_shard(
+                x,
+                0,
+                self.tp.device_group.group_name,
+            )
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+
 class GEMMAllReducePass(VllmPatternMatcherPass):
     """
     Inductor pass that fuses GEMM + all-reduce into a single iris-backed
@@ -1134,6 +1277,16 @@ class GEMMAllReducePass(VllmPatternMatcherPass):
         self.patterns: PatternMatcherPass = PatternMatcherPass(
             pass_name="gemm_all_reduce_pass"
         )
+
+        # Every pattern in this pass lowers to the same aiter op, so without it
+        # there is nothing to register and tracing a replacement would raise.
+        if not _has_aiter_op("fused_gemm_all_reduce_k_shard"):
+            raise RuntimeError(
+                "fuse_gemm_all_reduce requires the aiter op "
+                "torch.ops.aiter.fused_gemm_all_reduce_k_shard, which is not "
+                "registered. Check that aiter is installed and that "
+                "`import aiter.ops.triton.comms.fused` succeeds."
+            )
 
         registered_patterns = ["GEMMAllReducePattern(aten.mm)"]
         GEMMAllReducePattern(self.model_dtype, self.device).register(self.patterns)
@@ -1200,10 +1353,21 @@ class AsyncTPPass(VllmFusionPatternMatcherPass):
         enable_symm_mem_for_group(get_tp_group().device_group.group_name)
         GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.pm_pass)
 
+        # Registered unconditionally, as upstream does: the replacement picks
+        # aiter or symm_mem at trace time depending on availability.
         AllGatherGEMMPattern(self.model_dtype, self.device).register(self.pm_pass)
 
-        # Find K-shard AGMM pattern
-        AllGatherGEMMPatternKShard(self.model_dtype, self.device).register(self.pm_pass)
+        # Find K-shard AGMM pattern. It has no symm_mem equivalent, so it is
+        # registered only when the aiter op is available.
+        if _has_aiter_op("fused_all_gather_gemm_k_shard"):
+            AllGatherGEMMPatternKShard(self.model_dtype, self.device).register(
+                self.pm_pass
+            )
+        elif current_platform.is_rocm():
+            logger.warning(
+                "aiter.fused_all_gather_gemm_k_shard op not registered, "
+                "skipping AllGatherGEMMPatternKShard"
+            )
 
         # These fusions are enabled only for bfloat16 models because
         # `scaled_mm` or `cutlass_scaled_mm` with per-token (row-wise) scaling
@@ -1269,7 +1433,116 @@ class AsyncTPPass(VllmFusionPatternMatcherPass):
                 # path; reduce-scatter needs a dedicated FP4 producer rather
                 # than the existing FP8-style helper.
 
+        # Registered last so that every upstream reduce-scatter pattern gets
+        # first refusal on the reduce_scatter node they all anchor on.
+        if current_platform.is_rocm():
+            self._register_rocm_reduce_scatter(config)
+
         self.dump_patterns(config, self.pm_pass)
+
+    def _register_rocm_reduce_scatter(self, config: VllmConfig) -> None:
+        """Register the iris-backed reduce-scatter patterns on ROCm.
+
+        Args:
+            config: The full vLLM config, used to derive the warmup shapes.
+        """
+        mode = getattr(self.pass_config, "fuse_gemm_reduce_scatter", "off")
+        if mode == "off":
+            return
+        if mode not in ("fused", "standalone"):
+            logger.warning(
+                "Unknown fuse_gemm_reduce_scatter=%r, expected one of "
+                "'off', 'fused', 'standalone'; disabling the fusion",
+                mode,
+            )
+            return
+
+        if mode == "standalone":
+            if not _has_aiter_op("reduce_scatter_m_shard"):
+                logger.warning(
+                    "aiter.reduce_scatter_m_shard op not registered, skipping "
+                    "ROCmReduceScatterPattern"
+                )
+                return
+            ROCmReduceScatterPattern(self.model_dtype, self.device).register(
+                self.pm_pass
+            )
+        else:
+            if not _has_aiter_op("gemm_reduce_scatter_m_shard"):
+                logger.warning(
+                    "aiter.gemm_reduce_scatter_m_shard op not registered, skipping "
+                    "ROCmGEMMReduceScatterPattern"
+                )
+                return
+            if not hasattr(torch.ops.vllm, "rocm_unquantized_gemm"):
+                logger.warning(
+                    "rocm_unquantized_gemm op not registered, skipping "
+                    "ROCmGEMMReduceScatterPattern"
+                )
+                return
+            ROCmGEMMReduceScatterPattern(self.model_dtype, self.device).register(
+                self.pm_pass
+            )
+            ROCmGEMMReduceScatterWithBiasPattern(
+                self.model_dtype, self.device
+            ).register(self.pm_pass)
+
+        logger.info("Registered ROCm iris reduce-scatter patterns (mode=%s)", mode)
+        self._register_reduce_scatter_warmup_shapes(config)
+
+    def _register_reduce_scatter_warmup_shapes(self, config: VllmConfig) -> None:
+        """Declare every (M, N, dtype) the aiter reduce-scatter cache must hold.
+
+        A cache miss inside a graph capture region performs a collective
+        symmetric-heap allocation and a Triton JIT compile, and deadlocks. The
+        shapes are recorded here and materialized by a later collective
+        `warmup_buffers()`, which must run after this pass is constructed and
+        before capture.
+
+        M is every cudagraph capture size and compile size divisible by the TP
+        size; SequenceParallelismPass only reduce-scatters the residual stream,
+        so N is the model hidden size.
+
+        Args:
+            config: The full vLLM config, holding the capture sizes and the
+                model hidden size.
+        """
+        if config.model_config is None or self.model_dtype is None:
+            logger.warning(
+                "No model config available, cannot pre-declare fused "
+                "reduce-scatter warmup shapes; the first captured forward will "
+                "allocate collectively and hang"
+            )
+            return
+
+        try:
+            from aiter.ops.triton.comms.fused import fused_gemm_reduce_scatter
+        except ImportError:
+            logger.warning(
+                "aiter.ops.triton.comms.fused.fused_gemm_reduce_scatter is not "
+                "importable, cannot pre-declare reduce-scatter warmup shapes"
+            )
+            return
+
+        n = config.model_config.get_hidden_size()
+        compilation_config = config.compilation_config
+        candidates = set(compilation_config.cudagraph_capture_sizes or ())
+        candidates.update(
+            m for m in (compilation_config.compile_sizes or ()) if isinstance(m, int)
+        )
+        tp_size = get_tensor_model_parallel_world_size()
+        m_sizes = sorted(m for m in candidates if m > 0 and m % tp_size == 0)
+
+        for m in m_sizes:
+            fused_gemm_reduce_scatter.register_shape(m, n, self.model_dtype)
+
+        logger.info(
+            "Declared %d fused reduce-scatter warmup shape(s): M=%s, N=%d, dtype=%s",
+            len(m_sizes),
+            m_sizes,
+            n,
+            self.model_dtype,
+        )
 
     def is_applicable_for_range(self, compile_range: Range) -> bool:
         # This pass is applied on top of the sequence parallelism pass,
