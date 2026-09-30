@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
+import os
 from collections.abc import Callable
 from contextlib import suppress
 
@@ -31,7 +31,20 @@ from ..vllm_inductor_pass import (
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
+os.environ.setdefault("TRITON_ALLOW_NON_CONSTEXPR_GLOBALS", "1")
+
+
+def is_aiter_fusion_available() -> bool:
+    """Check if aiter fused ops are available (runtime check)"""
+    return hasattr(torch.ops, "aiter") and hasattr(
+        torch.ops.aiter, "fused_all_gather_gemm_k_shard"
+    )
+
+
 logger = init_logger(__name__)
+
+if hasattr(torch.ops._C, "scaled_fp4_quant"):
+    STATIC_FP4_QUANT_OP = torch.ops._C.scaled_fp4_quant.default
 
 
 def _flashinfer_scaled_mm_out(
@@ -393,10 +406,75 @@ class AllGatherGEMMPattern(BasePattern):
             return torch.ops.aten.mm.default(all_gather, weight)
 
         def replacement(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-            ag_output, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
+            if current_platform.is_rocm():
+                ag_output, mm_outputs = torch.ops.aiter.fused_all_gather_gemm_m_shard(
+                    x,
+                    [weight],
+                    gather_dim=0,
+                    group_name=self.tp.device_group.group_name,
+                )
+            else:
+                ag_output, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
+                    x,
+                    [weight],
+                    gather_dim=0,
+                    group_name=self.tp.device_group.group_name,
+                )
+            return mm_outputs
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+
+class AllGatherGEMMPatternKShard(BasePattern):
+    """
+    Pattern for all-gather + GEMM fusion with K-dimension sharding.
+
+    This pattern handles the case where the input is sharded along the K dimension:
+    - Input: (M, K_local) where K is sharded across ranks
+    - All-gather on dim=1 produces (M, K) where K = K_local * world_size
+    - Then performs GEMM: (M, K) @ (K, N) = (M, N)
+    """
+
+    def get_inputs(self):
+        # Input is sharded on K dimension: (M, K_local)
+        # Use dimensions that won't cause shape issues during tracing
+        M = 8  # Batch dimension
+        K_local = 4  # Local K dimension
+        K_total = K_local * self.tp_size  # Total K after all-gather
+        N = 8  # Output dimension
+
+        x = torch.empty([M, K_local], device=self.device, dtype=self.dtype)
+        # Weight needs full K dimension after all-gather: (K, N)
+        weight = torch.empty([K_total, N], device=self.device, dtype=self.dtype)
+
+        return [x, weight]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> torch.Tensor:
+            all_gather = torch.ops.vllm.all_gather.default(
+                x,
+                dim=1,  # K-dimension sharding
+                world_size=self.tp_size,
+                group_name=self.tp.unique_name,
+            )
+
+            return torch.ops.aten.mm.default(all_gather, weight)
+
+        def replacement(
+            x: torch.Tensor, weight: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            # Only use aiter.fused_all_gather_gemm_k_shard for K-sharding
+            # Note: symm_mem.fused_all_gather_matmul doesn't support
+            # K-dimension sharding
+            ag_output, mm_outputs = torch.ops.aiter.fused_all_gather_gemm_k_shard(
                 x,
                 [weight],
-                gather_dim=0,
+                gather_dim=1,  # K-dimension
                 group_name=self.tp.device_group.group_name,
             )
             return mm_outputs
@@ -550,7 +628,7 @@ class CutlassScaledMMReduceScatterPattern(BasePattern):
         cutlass_mm_output = torch.empty([16, 16], device=self.device, dtype=self.dtype)
         return [input, mm_weight, scale_a, scale_b, cutlass_mm_output]
 
-    def register(self, pm_pass: PatternMatcherPass) -> None:
+    def register(self, pm_pass: PatternMatcherPass):
         def pattern(
             input: torch.Tensor,
             weight: torch.Tensor,
@@ -610,7 +688,7 @@ class CutlassScaledMMReduceScatterPattern(BasePattern):
 
 
 class AllGatherCutlassScaledMMPattern(BasePattern):
-    def get_inputs(self) -> list[torch.Tensor]:
+    def get_inputs(self):
         x = torch.empty([8, 16], device=self.device, dtype=FP8_DTYPE)
         weight = (
             torch.empty([16, 16], device=self.device, dtype=FP8_DTYPE)
@@ -897,6 +975,223 @@ class FlashInferAllGatherFP4Pattern(
         return _replacement
 
 
+class GEMMAllReducePattern(BasePattern):
+    """
+    Pattern for GEMM + all-reduce fusion with K-dimension sharding.
+
+    Matches RowParallelLinear output projection:
+    - Input: (M, K_local) where K is sharded across ranks
+    - GEMM: (M, K_local) @ (K_local, N) = (M, N) partial sum
+    - All-reduce sums partial results across ranks -> (M, N) final
+    Replaced by a single fused_gemm_all_reduce_k_shard kernel.
+    """
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        x = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        weight = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        return [x, weight]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> torch.Tensor:
+            mm = torch.ops.aten.mm.default(x, weight)
+            ar = torch.ops.vllm.all_reduce.default(
+                mm,
+                group_name=self.tp.unique_name,
+            )
+            return ar
+
+        def replacement(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> torch.Tensor:
+            c_local, c_global = torch.ops.aiter.fused_gemm_all_reduce_k_shard(
+                x,
+                [weight],
+                0,
+                self.tp.device_group.group_name,
+            )
+            return c_global
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+
+class ROCmGEMMAllReducePattern(BasePattern):
+    """
+    Pattern for ROCm unquantized GEMM + all-reduce fusion.
+
+    On ROCm, UnquantizedLinearMethod dispatches through
+    torch.ops.vllm.rocm_unquantized_gemm (which runtime-selects between
+    aiter Triton GEMM and rocBLAS). This pattern matches:
+        rocm_unquantized_gemm(x, weight, bias=None) -> all_reduce(result)
+    and replaces with fused_gemm_all_reduce_k_shard.
+
+    Only matches when bias is None (RowParallelLinear on ranks > 0).
+    Weight is in (N, K_local) layout (F.linear convention), so it is
+    transposed to (K_local, N) for the fused kernel.
+    """
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        x = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        weight = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        return [x, weight]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> torch.Tensor:
+            gemm = torch.ops.vllm.rocm_unquantized_gemm.default(x, weight, None)
+            ar = torch.ops.vllm.all_reduce.default(
+                gemm,
+                group_name=self.tp.unique_name,
+            )
+            return ar
+
+        def replacement(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> torch.Tensor:
+            c_local, c_global = torch.ops.aiter.fused_gemm_all_reduce_k_shard(
+                x,
+                [weight.t()],
+                0,
+                self.tp.device_group.group_name,
+            )
+            return c_global
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+
+class ROCmGEMMAllReduceWithBiasPattern(BasePattern):
+    """
+    Pattern for ROCm unquantized GEMM + all-reduce fusion when bias is present.
+
+    Matches RowParallelLinear on rank 0 where bias is a real tensor:
+        rocm_unquantized_gemm(x, weight, bias) -> all_reduce(result)
+    Replaced with fused_gemm_all_reduce_k_shard + bias addition.
+
+    Correctness: RowParallelLinear only adds bias on tp_rank==0; other ranks
+    pass bias=None (matched by ROCmGEMMAllReducePattern). After all-reduce
+    the bias appears exactly once in the final result.
+    """
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        x = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        weight = torch.empty([4, 4], device=self.device, dtype=self.dtype)
+        bias = torch.empty([4], device=self.device, dtype=self.dtype)
+        return [x, weight, bias]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor,
+        ) -> torch.Tensor:
+            gemm = torch.ops.vllm.rocm_unquantized_gemm.default(x, weight, bias)
+            ar = torch.ops.vllm.all_reduce.default(
+                gemm,
+                group_name=self.tp.unique_name,
+            )
+            return ar
+
+        def replacement(
+            x: torch.Tensor,
+            weight: torch.Tensor,
+            bias: torch.Tensor,
+        ) -> torch.Tensor:
+            c_local, c_global = torch.ops.aiter.fused_gemm_all_reduce_k_shard(
+                x,
+                [weight.t()],
+                0,
+                self.tp.device_group.group_name,
+            )
+            return c_global + bias
+
+        pm.register_replacement(
+            pattern, replacement, self.get_inputs(), pm.fwd_only, pm_pass
+        )
+
+
+class GEMMAllReducePass(VllmPatternMatcherPass):
+    """
+    Inductor pass that fuses GEMM + all-reduce into a single iris-backed
+    kernel. Must run BEFORE SequenceParallelismPass so that the all_reduce
+    node is still present in the graph.
+    """
+
+    @enable_fake_mode
+    def __init__(self, config: VllmConfig) -> None:
+        super().__init__(config)
+
+        enable_symm_mem_for_group(get_tp_group().device_group.group_name)
+        self.patterns: PatternMatcherPass = PatternMatcherPass(
+            pass_name="gemm_all_reduce_pass"
+        )
+
+        registered_patterns = ["GEMMAllReducePattern(aten.mm)"]
+        GEMMAllReducePattern(self.model_dtype, self.device).register(self.patterns)
+
+        if current_platform.is_rocm():
+            try:
+                _ = torch.ops.vllm.rocm_unquantized_gemm.default
+                ROCmGEMMAllReducePattern(self.model_dtype, self.device).register(
+                    self.patterns
+                )
+                ROCmGEMMAllReduceWithBiasPattern(
+                    self.model_dtype, self.device
+                ).register(self.patterns)
+                registered_patterns.append("ROCmGEMMAllReducePattern(bias=None)")
+                registered_patterns.append(
+                    "ROCmGEMMAllReduceWithBiasPattern(bias=Tensor)"
+                )
+                logger.info(
+                    "Registered ROCmGEMMAllReducePattern (bias=None + "
+                    "bias=Tensor) for rocm_unquantized_gemm + all_reduce fusion"
+                )
+            except AttributeError:
+                logger.warning(
+                    "rocm_unquantized_gemm op not registered, "
+                    "skipping ROCmGEMMAllReducePattern"
+                )
+
+        logger.debug(
+            "GEMMAllReducePass registered %d pattern(s): %s",
+            len(registered_patterns),
+            ", ".join(registered_patterns),
+        )
+        self.dump_patterns(config, self.patterns)
+
+    # Minimum M dimension for the fused kernel. The persistent Triton kernel
+    # requires block_size_m to be a power of 2 and M >= block_size_m.
+    # For M < 16, the overhead of fusion exceeds any benefit.
+    MIN_M_FOR_FUSION = 16
+
+    def is_applicable_for_range(self, compile_range: Range) -> bool:
+        if (
+            not self.compilation_config.splitting_ops
+            or self.compilation_config.use_inductor_graph_partition
+        ):
+            return True
+        tp_size = get_tensor_model_parallel_world_size()
+        if not (compile_range.is_single_size() and compile_range.end % tp_size == 0):
+            return False
+        # Skip fusion for very small M — the fused Triton kernel requires
+        # M >= block_size_m (min 16) and small batches don't benefit from fusion.
+        return compile_range.end >= self.MIN_M_FOR_FUSION
+
+    @VllmInductorPass.time_and_log
+    def __call__(self, graph: fx.Graph) -> None:
+        self.matched_count = self.patterns.apply(graph)
+        logger.info("GEMMAllReducePass replaced %s patterns", self.matched_count)
+
+
 class AsyncTPPass(VllmFusionPatternMatcherPass):
     @enable_fake_mode
     def __init__(self, config: VllmConfig) -> None:
@@ -906,6 +1201,9 @@ class AsyncTPPass(VllmFusionPatternMatcherPass):
         GEMMReduceScatterPattern(self.model_dtype, self.device).register(self.pm_pass)
 
         AllGatherGEMMPattern(self.model_dtype, self.device).register(self.pm_pass)
+
+        # Find K-shard AGMM pattern
+        AllGatherGEMMPatternKShard(self.model_dtype, self.device).register(self.pm_pass)
 
         # These fusions are enabled only for bfloat16 models because
         # `scaled_mm` or `cutlass_scaled_mm` with per-token (row-wise) scaling
