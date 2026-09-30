@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 import functools
 from collections.abc import Callable
 from typing import Any, ParamSpec, TypeVar
@@ -140,6 +141,135 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
 
         VllmPatternMatcherPass.log_match_summary()
 
+    def _warmup_fused_reduce_scatter(self, config: VllmConfig) -> None:
+        """Size the iris symmetric heap from this deployment and warm the ops.
+
+        Must run after `AsyncTPPass` is constructed, since that is what declares
+        the shapes. Anything left unwarmed performs a Triton JIT compile or an RCCL
+        communicator creation on its first forward, both of which deadlock inside a
+        graph capture region.
+
+        The heap size is DERIVED here, from the scheduler's own token ceiling, and
+        not left to the op's fallback. It used to be: `init_iris()` with no argument
+        took a fixed 1 GiB default, the warmup covered only the cudagraph capture
+        sizes (largest M=512), and the first prefill wider than that allocated on the
+        heap mid-forward. The heap never frees, so a few such prefills exhausted it
+        and killed the engine a handful of requests in. `max_num_batched_tokens` is
+        the number that bounds what the scheduler can hand the op, so it is the
+        number both the heap size and the staging slabs are computed from.
+
+        Args:
+            config: The full vLLM config, holding the capture sizes, the model
+                dtype and hidden size, and the scheduler's token budget.
+        """
+        from vllm.distributed import get_tp_group
+        from vllm.distributed.parallel_state import (
+            get_tensor_model_parallel_world_size,
+        )
+
+        try:
+            from aiter.ops.triton.comms.fused.fused_gemm_reduce_scatter import (
+                HeapTooSmallError,
+                heap_bytes_required,
+                init_iris,
+                warmup_buffers,
+            )
+        except ImportError as e:
+            logger.warning("Failed to import iris fused GEMM+reduce_scatter: %s", e)
+            return
+
+        compilation_config = config.compilation_config
+        compile_sizes = set(compilation_config.cudagraph_capture_sizes or ())
+        compile_sizes.update(
+            m for m in (compilation_config.compile_sizes or ()) if isinstance(m, int)
+        )
+
+        model_config = config.model_config
+        weight_shapes = None
+        dtype = None
+        if model_config is not None:
+            hidden_size = model_config.get_hidden_size()
+            weight_shapes = [(hidden_size, hidden_size)]
+            dtype = model_config.dtype
+
+        tp_size = get_tensor_model_parallel_world_size()
+        max_m = self._fused_reduce_scatter_max_m(config, compile_sizes, tp_size)
+
+        heap_size = None
+        if weight_shapes is not None and dtype is not None:
+            heap_size = heap_bytes_required(
+                max_m, [n for _, n in weight_shapes], [dtype], tp_size
+            )
+            logger.info(
+                "Sizing the iris symmetric heap for fused GEMM+reduce_scatter: "
+                "max_num_batched_tokens -> M_max=%d, N=%d, dtype=%s, TP=%d "
+                "-> %d bytes (%.1f MiB)",
+                max_m,
+                hidden_size,
+                dtype,
+                tp_size,
+                heap_size,
+                heap_size / (1 << 20),
+            )
+        else:
+            logger.warning(
+                "No model config, so the iris symmetric heap cannot be sized from "
+                "this deployment; falling back to the aiter default, which is not "
+                "sized for any particular workload"
+            )
+
+        try:
+            init_iris(heap_size=heap_size)
+            warmup_buffers(
+                compile_sizes=sorted(compile_sizes),
+                weight_shapes=weight_shapes,
+                dtype=dtype,
+                group_name=get_tp_group().device_group.group_name,
+                max_m=max_m,
+            )
+        except HeapTooSmallError:
+            # Deliberately NOT swallowed. The broad handler below exists so that a
+            # broken or absent iris degrades to the RCCL path instead of killing the
+            # server -- but degrading is not on the table here. By the time this runs
+            # the fusion pass has already rewritten the graph, so the fused op WILL
+            # be called; a heap too small to stage it means the server starts and
+            # then dies mid-request with an allocator OOM, which is precisely the
+            # failure the capacity check exists to replace. Refuse at startup, where
+            # the message names the numbers and the operator can act on it.
+            raise
+        except Exception as e:
+            logger.warning(
+                "Failed to initialize iris for fused GEMM+reduce_scatter: %s", e
+            )
+
+    @staticmethod
+    def _fused_reduce_scatter_max_m(
+        config: VllmConfig, compile_sizes: set[int], tp_size: int
+    ) -> int:
+        """Largest M the scheduler can hand the fused reduce-scatter ops.
+
+        `max_num_batched_tokens` is the scheduler's ceiling on tokens per forward and
+        so on the reduce-scatter's M. It is rounded UP to a multiple of the TP size
+        because the op shards M across ranks and rejects an M that is not divisible.
+        The captured sizes are folded in only as a floor: they are always <= the
+        budget in practice, but a config that captured above it must still be warmed.
+
+        Args:
+            config: The full vLLM config.
+            compile_sizes: Capture and compile sizes already collected.
+            tp_size: Tensor-parallel world size.
+
+        Returns:
+            M_max in rows.
+        """
+        budget = 0
+        scheduler_config = getattr(config, "scheduler_config", None)
+        if scheduler_config is not None:
+            budget = int(getattr(scheduler_config, "max_num_batched_tokens", 0) or 0)
+        largest_captured = max(compile_sizes) if compile_sizes else 0
+        max_m = max(budget, largest_captured, tp_size)
+        return -(-max_m // tp_size) * tp_size
+
     def configure(self, config: VllmConfig) -> None:
         self.pass_config = config.compilation_config.pass_config
         model_config = config.model_config
@@ -159,10 +289,9 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 self.passes += [NoOpEliminationPass(config)]
 
             if self.pass_config.fuse_gemm_all_reduce:
-                from .fusion.collective_fusion import GEMMAllReducePass
-
-                self.passes += [GEMMAllReducePass(config)]
-
+                # Import aiter BEFORE constructing the pass: the aiter custom
+                # ops are registered as a side effect of this import, and the
+                # pass refuses to build if they are missing.
                 if current_platform.is_rocm():
                     try:
                         from aiter.ops.triton.comms.fused.fused_gemm_all_reduce import (
@@ -181,10 +310,25 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                             "Failed to initialize iris for fused GEMM+AR: %s", e
                         )
 
+                from .fusion.collective_fusion import GEMMAllReducePass
+
+                self.passes += [GEMMAllReducePass(config)]
+
             if self.pass_config.enable_sp:
                 self.passes += [SequenceParallelismPass(config)]
                 if self.pass_config.fuse_gemm_comms:
+                    if current_platform.is_rocm():
+                        # AsyncTPPass probes for aiter ops when deciding which
+                        # patterns to register, so import aiter first.
+                        with contextlib.suppress(Exception):
+                            import aiter.ops.triton.comms.fused  # noqa: F401
+
                     self.passes += [AsyncTPPass(config)]
+
+                    if current_platform.is_rocm() and (
+                        self.pass_config.fuse_gemm_reduce_scatter not in (None, "off")
+                    ):
+                        self._warmup_fused_reduce_scatter(config)
 
             if enable_transformers_norm_canonicalization:
                 self.passes += [AddRMSNormFusionPass(config)]

@@ -51,6 +51,12 @@ SP_MIN_PER_GPU_SIZE_MB: dict[int, float] = {
     100: 32,
 }
 
+# ROCm has no device-capability buckets; xGMI-connected MI300/MI350 parts share
+# one policy. The hidden-size floor admits gpt-oss (2880) and the per-GPU size
+# is small so SP engages well inside a typical prefill batch.
+SP_MIN_HIDDEN_SIZE_ROCM = 2048
+SP_MIN_PER_GPU_SIZE_MB_ROCM = 0.5
+
 
 def get_sequence_parallelism_threshold(
     hidden_size: int,
@@ -75,6 +81,9 @@ def get_sequence_parallelism_threshold(
     if current_platform.is_xpu():
         min_hidden_size = 4096
         min_per_gpu_size_mb = 8.0
+    elif current_platform.is_rocm():
+        min_hidden_size = SP_MIN_HIDDEN_SIZE_ROCM
+        min_per_gpu_size_mb = SP_MIN_PER_GPU_SIZE_MB_ROCM
     elif current_platform.is_cuda():
         capability = current_platform.get_device_capability()
         if capability is None:
